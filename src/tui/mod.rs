@@ -1,0 +1,1668 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use crate::{
+    client::PanClient,
+    config::AppConfig,
+    download::{
+        DownloadEvent, DownloadJobState, DownloadOptions, DownloadSummary, JobId, TransferId,
+        TransferState, format_bytes,
+    },
+    job::DownloadJobSnapshot,
+    job_client::JobUpdate,
+    logger::{LogEntry, LogLevel, SessionLogger},
+    plan::safe_name,
+    provider::{
+        ProfileId, ProviderCatalogEntry, ProviderId, ProviderIdentity, ProviderSetting,
+        ProviderSettingKind, ProviderSettingsSnapshot, ProviderStatus, RemoteItem, RemoteSource,
+        SourceId,
+    },
+    settings::NetworkSettings,
+};
+use anyhow::{Context, Result};
+use ratatui::{
+    DefaultTerminal,
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+};
+
+mod render;
+mod runtime;
+#[cfg(test)]
+mod tests;
+
+use render::render_ui;
+#[cfg(test)]
+use runtime::record_download_event;
+pub use runtime::run_browser;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserMode {
+    Browsing,
+    Confirming,
+    Scanning,
+    Downloading,
+    Finished,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserLayer {
+    SharedLinks,
+    DriveFolder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppTab {
+    Files,
+    Logs,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelFocus {
+    Upper,
+    Lower,
+}
+
+#[derive(Clone, Debug)]
+struct SettingsForm {
+    proxy: String,
+    cursor: usize,
+    editing: bool,
+    status: String,
+}
+
+impl SettingsForm {
+    fn new(settings: &NetworkSettings) -> Self {
+        let proxy = settings.proxy_input().to_owned();
+        let cursor = proxy.chars().count();
+        Self {
+            proxy,
+            cursor,
+            editing: false,
+            status: "Blank means direct connection; system proxy variables are ignored.".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderField {
+    spec: ProviderSetting,
+    value: String,
+    original: String,
+    secret_configured: bool,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderSettingsForm {
+    fields: Vec<ProviderField>,
+    selected: usize,
+    editing: bool,
+    status: String,
+    read_only_reason: Option<String>,
+}
+
+impl ProviderSettingsForm {
+    fn from_snapshot<S>(schema: Vec<S>, snapshot: &ProviderSettingsSnapshot) -> Self
+    where
+        S: Into<ProviderSetting>,
+    {
+        let fields = schema
+            .into_iter()
+            .map(Into::into)
+            .map(|spec: ProviderSetting| {
+                let value = snapshot.values.get(&spec.key).cloned().unwrap_or_default();
+                let cursor = value.chars().count();
+                ProviderField {
+                    secret_configured: snapshot.configured_secrets.contains(&spec.key),
+                    spec,
+                    original: value.clone(),
+                    value,
+                    cursor,
+                }
+            })
+            .collect();
+        Self {
+            fields,
+            status: snapshot
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| "Provider settings are saved independently.".to_owned()),
+            read_only_reason: snapshot.read_only_reason.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn selected_field(&self) -> Option<&ProviderField> {
+        self.fields.get(self.selected)
+    }
+
+    fn selected_field_mut(&mut self) -> Option<&mut ProviderField> {
+        self.fields.get_mut(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let count = self.fields.len();
+        self.selected = if delta < 0 {
+            (self.selected + count - 1) % count
+        } else {
+            (self.selected + 1) % count
+        };
+    }
+
+    fn changes(&self) -> BTreeMap<String, String> {
+        self.fields
+            .iter()
+            .filter(|field| {
+                field.spec.kind != ProviderSettingKind::Action
+                    && field.value != field.original
+                    && !(field.spec.kind == ProviderSettingKind::Secret
+                        && field.value.is_empty()
+                        && field.secret_configured)
+            })
+            .map(|field| (field.spec.key.to_owned(), field.value.clone()))
+            .collect()
+    }
+
+    fn display_value(field: &ProviderField, editing: bool) -> String {
+        if field.spec.kind == ProviderSettingKind::Secret {
+            if editing && !field.value.is_empty() {
+                with_cursor(&"*".repeat(field.value.chars().count()), field.cursor)
+            } else if field.secret_configured || !field.value.is_empty() {
+                "********".to_owned()
+            } else {
+                "<not configured>".to_owned()
+            }
+        } else if editing {
+            with_cursor(&field.value, field.cursor)
+        } else if field.value.is_empty() {
+            "<blank>".to_owned()
+        } else {
+            field.value.clone()
+        }
+    }
+
+    fn handle_edit_key(&mut self, code: KeyCode) {
+        let Some(field) = self.selected_field_mut() else {
+            return;
+        };
+        if field.spec.kind == ProviderSettingKind::Action {
+            return;
+        }
+        match code {
+            KeyCode::Left => field.cursor = field.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                field.cursor = field
+                    .cursor
+                    .saturating_add(1)
+                    .min(field.value.chars().count())
+            }
+            KeyCode::Home => field.cursor = 0,
+            KeyCode::End => field.cursor = field.value.chars().count(),
+            KeyCode::Backspace if field.cursor > 0 => {
+                remove_char(&mut field.value, field.cursor - 1);
+                field.cursor -= 1;
+            }
+            KeyCode::Delete if field.cursor < field.value.chars().count() => {
+                remove_char(&mut field.value, field.cursor);
+            }
+            KeyCode::Char(character) => {
+                insert_char(&mut field.value, field.cursor, character);
+                field.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFilter {
+    All,
+    Info,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TransferFilter {
+    #[default]
+    All,
+    Active,
+    Failed,
+}
+
+impl TransferFilter {
+    fn matches(self, state: TransferState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => matches!(state, TransferState::Queued | TransferState::Running),
+            Self::Failed => state == TransferState::Failed,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Active => "Active",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormField {
+    Destination,
+    Workers,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadForm {
+    destination_root: String,
+    cursor: usize,
+    workers: usize,
+    field: FormField,
+}
+
+impl DownloadForm {
+    fn new(destination: &Path) -> Self {
+        let destination_root = destination.display().to_string();
+        let cursor = destination_root.chars().count();
+        Self {
+            destination_root,
+            cursor,
+            workers: 1,
+            field: FormField::Destination,
+        }
+    }
+
+    fn toggle_field(&mut self) {
+        self.field = match self.field {
+            FormField::Destination => FormField::Workers,
+            FormField::Workers => FormField::Destination,
+        };
+    }
+}
+
+impl LogFilter {
+    fn matches(self, level: LogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Info => level == LogLevel::Info,
+            Self::Error => level == LogLevel::Error,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Info => "Info",
+            Self::Error => "Error",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PageLocation {
+    SharedLinks,
+    Folder(Box<RemoteItem>),
+}
+
+#[derive(Clone, Debug)]
+struct FolderPage {
+    location: PageLocation,
+    items: Vec<RemoteItem>,
+    selected: Option<usize>,
+    offset: usize,
+}
+
+impl FolderPage {
+    fn shared(items: Vec<RemoteItem>) -> Self {
+        let selected = (!items.is_empty()).then_some(0);
+        Self {
+            location: PageLocation::SharedLinks,
+            items,
+            selected,
+            offset: 0,
+        }
+    }
+
+    fn folder(folder: RemoteItem, items: Vec<RemoteItem>) -> Self {
+        let selected = (!items.is_empty()).then_some(0);
+        Self {
+            location: PageLocation::Folder(Box::new(folder)),
+            items,
+            selected,
+            offset: 0,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match &self.location {
+            PageLocation::SharedLinks => "Shared links",
+            PageLocation::Folder(folder) => &folder.name,
+        }
+    }
+
+    fn drive_folder(&self) -> Option<&RemoteItem> {
+        match &self.location {
+            PageLocation::SharedLinks => None,
+            PageLocation::Folder(folder) => Some(folder),
+        }
+    }
+
+    fn is_shared_root(&self) -> bool {
+        matches!(self.location, PageLocation::SharedLinks)
+    }
+}
+
+impl TransferState {
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::Running => 0,
+            Self::Failed => 1,
+            Self::Interrupted => 2,
+            Self::Queued => 3,
+            Self::Skipped => 4,
+            Self::Completed => 5,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "WAIT",
+            Self::Running => "RUN ",
+            Self::Completed => "DONE",
+            Self::Skipped => "SKIP",
+            Self::Failed => "FAIL",
+            Self::Interrupted => "STOP",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TransferDisplay {
+    id: TransferId,
+    path: PathBuf,
+    status: TransferState,
+    written: u64,
+    total: Option<u64>,
+    bytes_per_second: f64,
+    detail: Option<String>,
+}
+
+impl TransferDisplay {
+    fn queued(id: TransferId, path: PathBuf, total: Option<u64>) -> Self {
+        Self {
+            id,
+            path,
+            status: TransferState::Queued,
+            written: 0,
+            total,
+            bytes_per_second: 0.0,
+            detail: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DownloadDisplay {
+    job_id: Option<JobId>,
+    state: Option<DownloadJobState>,
+    transfers: BTreeMap<TransferId, TransferDisplay>,
+    transfer_filter: TransferFilter,
+    transfer_selected: usize,
+    transfer_offset: usize,
+    files: usize,
+    overall_written: u64,
+    partial_bytes: u64,
+    items_processed: usize,
+    items_total: usize,
+    workers: usize,
+    downloaded: usize,
+    skipped: usize,
+    failed: usize,
+    pre_skipped: usize,
+    last_issue: Option<String>,
+    fatal: Option<String>,
+}
+
+impl DownloadDisplay {
+    fn sorted_transfers(&self) -> Vec<&TransferDisplay> {
+        let mut transfers: Vec<_> = self
+            .transfers
+            .values()
+            .filter(|transfer| self.transfer_filter.matches(transfer.status))
+            .collect();
+        transfers.sort_by(|left, right| {
+            left.status
+                .sort_rank()
+                .cmp(&right.status.sort_rank())
+                .then_with(|| {
+                    if left.status == TransferState::Completed {
+                        right.id.cmp(&left.id)
+                    } else {
+                        left.id.cmp(&right.id)
+                    }
+                })
+        });
+        transfers
+    }
+
+    fn aggregate_speed(&self) -> f64 {
+        self.transfers
+            .values()
+            .filter(|transfer| transfer.status == TransferState::Running)
+            .map(|transfer| transfer.bytes_per_second)
+            .sum()
+    }
+
+    fn status_count(&self, status: TransferState) -> usize {
+        self.transfers
+            .values()
+            .filter(|transfer| transfer.status == status)
+            .count()
+    }
+
+    fn move_transfer_selection(&mut self, delta: isize) {
+        let maximum = self.sorted_transfers().len().saturating_sub(1);
+        self.transfer_selected = if delta < 0 {
+            self.transfer_selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.transfer_selected
+                .saturating_add(delta as usize)
+                .min(maximum)
+        };
+        self.transfer_offset = self.transfer_selected;
+    }
+
+    fn set_transfer_filter(&mut self, filter: TransferFilter) {
+        self.transfer_filter = filter;
+        self.transfer_selected = 0;
+        self.transfer_offset = 0;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowserApp {
+    pages: Vec<FolderPage>,
+    source_sessions: BTreeMap<SourceSessionKey, SourceSession>,
+    current_source: Option<SourceSessionKey>,
+    mode: BrowserMode,
+    message: String,
+    page_step: usize,
+    destination: PathBuf,
+    download_target: Option<RemoteItem>,
+    download_destination: Option<PathBuf>,
+    download_form: Option<DownloadForm>,
+    download: DownloadDisplay,
+    active_tab: AppTab,
+    files_focus: PanelFocus,
+    logs_focus: PanelFocus,
+    settings_focus: PanelFocus,
+    network_settings: NetworkSettings,
+    settings_form: Option<SettingsForm>,
+    provider_form: Option<ProviderSettingsForm>,
+    provider_name: String,
+    profile_name: String,
+    source_name: String,
+    provider_status: String,
+    provider_settings_count: usize,
+    provider_choices: Vec<ProviderChoice>,
+    active_provider: usize,
+    provider_selector: Option<ProviderSelector>,
+    logs: Vec<LogEntry>,
+    log_filter: LogFilter,
+    log_offset_from_bottom: usize,
+    quit_confirming: bool,
+    daemon_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum BrowserOutcome {
+    Quit,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourceSessionKey {
+    identity: ProviderIdentity,
+    source_id: SourceId,
+}
+
+#[derive(Clone, Debug)]
+struct SourceSession {
+    pages: Vec<FolderPage>,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct SourceChoice {
+    id: SourceId,
+    name: String,
+    root: RemoteItem,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderChoice {
+    id: ProviderId,
+    name: String,
+    profile: ProfileId,
+    status: String,
+    settings_count: usize,
+    sources: Vec<SourceChoice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderSelector {
+    provider: usize,
+    source: usize,
+}
+
+struct ProviderActivation {
+    restored: bool,
+    root_to_load: Option<RemoteItem>,
+}
+
+pub struct BrowserProvider {
+    id: ProviderId,
+    name: String,
+    identity: ProviderIdentity,
+    status: ProviderStatus,
+    available: bool,
+    settings_schema: Vec<ProviderSetting>,
+    sources: Vec<RemoteSource>,
+    source_error: Option<String>,
+    settings: ProviderSettingsSnapshot,
+}
+
+impl BrowserProvider {
+    pub fn new(entry: ProviderCatalogEntry) -> Self {
+        Self {
+            id: entry.id,
+            name: entry.display_name,
+            identity: entry.identity,
+            status: entry.status,
+            available: entry.available,
+            settings_schema: entry.settings_schema,
+            sources: Vec::new(),
+            source_error: None,
+            settings: entry.settings,
+        }
+    }
+
+    fn update(&mut self, entry: ProviderCatalogEntry) {
+        self.id = entry.id;
+        self.name = entry.display_name;
+        self.identity = entry.identity;
+        self.status = entry.status;
+        self.available = entry.available;
+        self.settings_schema = entry.settings_schema;
+        self.settings = entry.settings;
+    }
+
+    pub fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.available
+    }
+
+    pub fn identity(&self) -> ProviderIdentity {
+        self.identity.clone()
+    }
+
+    pub fn status(&self) -> ProviderStatus {
+        self.status.clone()
+    }
+
+    fn status_label(&self) -> String {
+        match &self.status {
+            ProviderStatus::Disabled => "Disabled".to_owned(),
+            ProviderStatus::NeedsConfig => "NeedsConfig".to_owned(),
+            ProviderStatus::Connecting => "Connecting".to_owned(),
+            ProviderStatus::Ready if self.source_error.is_none() => "Ready".to_owned(),
+            ProviderStatus::Ready => format!(
+                "SourceError: {}",
+                self.source_error.as_deref().unwrap_or("unknown")
+            ),
+            ProviderStatus::ConfigError(message) => format!("ConfigError: {message}"),
+            ProviderStatus::ConnectionError(message) => format!("ConnectionError: {message}"),
+        }
+    }
+
+    async fn refresh_sources(&mut self, client: &dyn PanClient) {
+        if !self.available {
+            self.sources.clear();
+            self.source_error = None;
+            return;
+        }
+        match client.sources(&self.identity).await {
+            Ok(sources) => {
+                self.sources = sources;
+                self.source_error = None;
+            }
+            Err(error) => {
+                self.sources.clear();
+                self.source_error = Some(error.to_string());
+            }
+        }
+    }
+}
+
+pub struct BrowserRuntime {
+    settings: PathBuf,
+    network: NetworkSettings,
+    destination: PathBuf,
+    options: DownloadOptions,
+    client: Arc<dyn PanClient>,
+}
+
+impl BrowserRuntime {
+    pub fn new(
+        client: Arc<dyn PanClient>,
+        settings: PathBuf,
+        network: NetworkSettings,
+        destination: PathBuf,
+        options: DownloadOptions,
+    ) -> Self {
+        Self {
+            settings,
+            network,
+            destination,
+            options,
+            client,
+        }
+    }
+}
+
+impl BrowserApp {
+    pub fn new(
+        shared_items: Vec<RemoteItem>,
+        destination: PathBuf,
+        network_settings: NetworkSettings,
+    ) -> Self {
+        Self {
+            pages: vec![FolderPage::shared(shared_items)],
+            source_sessions: BTreeMap::new(),
+            current_source: None,
+            mode: BrowserMode::Browsing,
+            message: "Ready".to_owned(),
+            page_step: 10,
+            destination,
+            download_target: None,
+            download_destination: None,
+            download_form: None,
+            download: DownloadDisplay::default(),
+            active_tab: AppTab::Files,
+            files_focus: PanelFocus::Upper,
+            logs_focus: PanelFocus::Upper,
+            settings_focus: PanelFocus::Upper,
+            network_settings,
+            settings_form: None,
+            provider_form: None,
+            provider_name: "Cloud Provider".to_owned(),
+            profile_name: "default".to_owned(),
+            source_name: "-".to_owned(),
+            provider_status: "NeedsConfig".to_owned(),
+            provider_settings_count: 0,
+            provider_choices: Vec::new(),
+            active_provider: 0,
+            provider_selector: None,
+            logs: Vec::new(),
+            log_filter: LogFilter::All,
+            log_offset_from_bottom: 0,
+            quit_confirming: false,
+            daemon_mode: false,
+        }
+    }
+
+    fn set_provider_catalog(&mut self, providers: &[BrowserProvider], active: usize) {
+        self.active_provider = active;
+        self.refresh_provider_catalog(providers);
+        self.refresh_provider_form(&providers[active]);
+        let choice = &self.provider_choices[active];
+        self.source_name = "-".to_owned();
+        self.pages = vec![FolderPage::shared(
+            choice
+                .sources
+                .iter()
+                .map(|source| source.root.clone())
+                .collect(),
+        )];
+    }
+
+    fn refresh_provider_catalog(&mut self, providers: &[BrowserProvider]) {
+        self.provider_choices = providers
+            .iter()
+            .map(|runtime| ProviderChoice {
+                id: runtime.id.clone(),
+                name: runtime.name.clone(),
+                profile: runtime.identity().profile_id,
+                status: runtime.status_label(),
+                settings_count: runtime.settings_schema.len(),
+                sources: runtime
+                    .sources
+                    .iter()
+                    .map(|source| SourceChoice {
+                        id: source.id.clone(),
+                        name: source.name.clone(),
+                        root: source.root.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let choice = &self.provider_choices[self.active_provider];
+        self.provider_name = choice.name.clone();
+        self.profile_name = choice.profile.to_string();
+        self.provider_status = choice.status.clone();
+        self.provider_settings_count = choice.settings_count;
+        if let Some(key) = &self.current_source
+            && let Some(source) = choice
+                .sources
+                .iter()
+                .find(|source| source.id == key.source_id)
+        {
+            self.source_name = source.name.clone();
+        }
+    }
+
+    fn refresh_provider_form(&mut self, runtime: &BrowserProvider) {
+        self.provider_form = Some(ProviderSettingsForm::from_snapshot(
+            runtime.settings_schema.clone(),
+            &runtime.settings,
+        ));
+    }
+
+    fn open_provider_selector(&mut self) {
+        let source = self
+            .current_source
+            .as_ref()
+            .and_then(|key| {
+                self.provider_choices[self.active_provider]
+                    .sources
+                    .iter()
+                    .position(|source| source.id == key.source_id)
+            })
+            .unwrap_or(0);
+        self.provider_selector = Some(ProviderSelector {
+            provider: self.active_provider,
+            source,
+        });
+    }
+
+    fn move_provider_selection(&mut self, delta: isize) {
+        let Some(selector) = self.provider_selector.as_mut() else {
+            return;
+        };
+        let count = self.provider_choices.len();
+        if count == 0 {
+            return;
+        }
+        selector.provider = if delta < 0 {
+            (selector.provider + count - 1) % count
+        } else {
+            (selector.provider + 1) % count
+        };
+        selector.source = 0;
+    }
+
+    fn move_source_selection(&mut self, delta: isize) {
+        let Some(selector) = self.provider_selector.as_mut() else {
+            return;
+        };
+        let count = self.provider_choices[selector.provider].sources.len();
+        if count == 0 {
+            selector.source = 0;
+            return;
+        }
+        selector.source = if delta < 0 {
+            (selector.source + count - 1) % count
+        } else {
+            (selector.source + 1) % count
+        };
+    }
+
+    fn save_current_source_session(&mut self) {
+        let Some(key) = self.current_source.clone() else {
+            return;
+        };
+        self.source_sessions.insert(
+            key,
+            SourceSession {
+                pages: std::mem::replace(&mut self.pages, vec![FolderPage::shared(Vec::new())]),
+                message: self.message.clone(),
+            },
+        );
+    }
+
+    fn activate_selection(
+        &mut self,
+        provider_index: usize,
+        source_index: Option<usize>,
+    ) -> ProviderActivation {
+        self.save_current_source_session();
+        let choice = self.provider_choices[provider_index].clone();
+        self.active_provider = provider_index;
+        self.provider_name = choice.name;
+        self.profile_name = choice.profile.to_string();
+        self.provider_status = choice.status;
+        self.provider_settings_count = choice.settings_count;
+        self.provider_selector = None;
+        let Some(source) = source_index
+            .and_then(|index| choice.sources.get(index))
+            .cloned()
+        else {
+            self.current_source = None;
+            self.source_name = "-".to_owned();
+            self.pages = vec![FolderPage::shared(Vec::new())];
+            self.message = self.provider_status.clone();
+            if self.provider_status != "Ready" {
+                self.active_tab = AppTab::Settings;
+                if self.settings_form.is_none() {
+                    self.settings_form = Some(SettingsForm::new(&self.network_settings));
+                }
+            }
+            return ProviderActivation {
+                restored: false,
+                root_to_load: None,
+            };
+        };
+        let key = SourceSessionKey {
+            identity: ProviderIdentity::new(choice.id, choice.profile),
+            source_id: source.id,
+        };
+        self.current_source = Some(key.clone());
+        self.source_name = source.name;
+        if let Some(session) = self.source_sessions.remove(&key) {
+            self.pages = session.pages;
+            self.message = session.message;
+            ProviderActivation {
+                restored: true,
+                root_to_load: None,
+            }
+        } else {
+            self.pages = vec![FolderPage::shared(vec![source.root.clone()])];
+            self.message = format!("Loading {}...", self.source_name);
+            ProviderActivation {
+                restored: false,
+                root_to_load: Some(source.root),
+            }
+        }
+    }
+
+    fn source_index_for_item(&self, item: &RemoteItem) -> Option<usize> {
+        self.provider_choices[self.active_provider]
+            .sources
+            .iter()
+            .position(|source| source.id == item.reference.source_id)
+    }
+
+    fn current(&self) -> &FolderPage {
+        self.pages.last().expect("browser always has a root page")
+    }
+
+    fn current_mut(&mut self) -> &mut FolderPage {
+        self.pages
+            .last_mut()
+            .expect("browser always has a root page")
+    }
+
+    fn selected_item(&self) -> Option<&RemoteItem> {
+        let page = self.current();
+        page.selected.and_then(|index| page.items.get(index))
+    }
+
+    fn selected_download_target(&self) -> Option<&RemoteItem> {
+        match self.browser_layer() {
+            BrowserLayer::SharedLinks => self.selected_item().filter(|item| item.is_folder()),
+            BrowserLayer::DriveFolder => self
+                .selected_item()
+                .filter(|item| item.is_folder() || item.can_download()),
+        }
+    }
+
+    fn download_target(&self) -> Option<&RemoteItem> {
+        self.download_target.as_ref()
+    }
+
+    fn download_target_breadcrumbs(&self) -> String {
+        self.download_target()
+            .map(|target| format!("{} / {}", self.breadcrumbs(), target.name))
+            .unwrap_or_else(|| self.breadcrumbs())
+    }
+
+    fn download_target_destination(&self) -> PathBuf {
+        self.download_destination
+            .clone()
+            .unwrap_or_else(|| self.destination.clone())
+    }
+
+    fn selected_target_destination(&self, root: &Path, target: &RemoteItem) -> PathBuf {
+        let mut path = root.to_path_buf();
+        for page in self.pages.iter().skip(1) {
+            if let Some(folder) = page.drive_folder() {
+                path.push(safe_name(&folder.name, folder.reference.object_id.as_str()));
+            }
+        }
+        path.join(safe_name(&target.name, target.reference.object_id.as_str()))
+    }
+
+    fn download_parent_destination(&self) -> PathBuf {
+        self.download_target_destination()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.destination.clone())
+    }
+
+    fn absolute_event_path(&self, relative: &Path) -> PathBuf {
+        self.download_parent_destination().join(relative)
+    }
+
+    fn planning_message(&self) -> &'static str {
+        match self.download_target() {
+            Some(target) if target.is_folder() => "Scanning selected folder recursively...",
+            Some(_) => "Preparing selected file...",
+            None => "Preparing download...",
+        }
+    }
+
+    fn current_drive_folder(&self) -> Option<&RemoteItem> {
+        self.current().drive_folder()
+    }
+
+    fn level_count_label(&self) -> String {
+        let count = self.current().items.len();
+        if self.current().is_shared_root() {
+            format!("{count} saved links")
+        } else {
+            format!("{count} direct items")
+        }
+    }
+
+    fn browser_layer(&self) -> BrowserLayer {
+        if self.current().is_shared_root() {
+            BrowserLayer::SharedLinks
+        } else {
+            BrowserLayer::DriveFolder
+        }
+    }
+
+    fn breadcrumbs(&self) -> String {
+        self.pages
+            .iter()
+            .map(FolderPage::name)
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+
+    fn select_previous(&mut self) {
+        let page = self.current_mut();
+        if page.items.is_empty() {
+            page.selected = None;
+            return;
+        }
+        page.selected = Some(match page.selected.unwrap_or(0) {
+            0 => page.items.len() - 1,
+            index => index - 1,
+        });
+    }
+
+    fn select_next(&mut self) {
+        let page = self.current_mut();
+        if page.items.is_empty() {
+            page.selected = None;
+            return;
+        }
+        page.selected = Some((page.selected.unwrap_or(0) + 1) % page.items.len());
+    }
+
+    fn select_first(&mut self) {
+        self.current_mut().selected = (!self.current().items.is_empty()).then_some(0);
+    }
+
+    fn select_last(&mut self) {
+        let len = self.current().items.len();
+        self.current_mut().selected = (len > 0).then_some(len - 1);
+    }
+
+    fn page_up(&mut self) {
+        let step = self.page_step;
+        let page = self.current_mut();
+        if let Some(index) = page.selected {
+            page.selected = Some(index.saturating_sub(step));
+        }
+    }
+
+    fn page_down(&mut self) {
+        let step = self.page_step;
+        let page = self.current_mut();
+        if let Some(index) = page.selected {
+            page.selected = Some((index + step).min(page.items.len().saturating_sub(1)));
+        }
+    }
+
+    fn handle_selection_key(&mut self, code: &KeyCode) -> bool {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => self.select_last(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn replace_current_items(&mut self, items: Vec<RemoteItem>) {
+        let selected_id = self
+            .selected_item()
+            .map(|item| item.reference.object_id.clone());
+        let selected = selected_id
+            .as_ref()
+            .and_then(|id| {
+                items
+                    .iter()
+                    .position(|item| &item.reference.object_id == id)
+            })
+            .or_else(|| (!items.is_empty()).then_some(0));
+        let page = self.current_mut();
+        page.items = items;
+        page.selected = selected;
+        page.offset = page.offset.min(page.items.len().saturating_sub(1));
+    }
+
+    fn enter_loaded(&mut self, folder: RemoteItem, children: Vec<RemoteItem>) {
+        self.pages.push(FolderPage::folder(folder, children));
+        self.message = "Folder loaded".to_owned();
+    }
+
+    fn go_back(&mut self) {
+        if self.pages.len() > 1 {
+            self.pages.pop();
+            self.message = "Returned to parent".to_owned();
+        }
+    }
+
+    fn request_download(&mut self) {
+        let Some(target) = self.selected_download_target().cloned() else {
+            return;
+        };
+        self.download_form = Some(DownloadForm::new(&self.destination));
+        self.download_destination =
+            Some(self.selected_target_destination(&self.destination, &target));
+        self.download_target = Some(target);
+        self.mode = BrowserMode::Confirming;
+    }
+
+    fn cancel_download(&mut self) {
+        self.mode = BrowserMode::Browsing;
+        self.message = "Download cancelled".to_owned();
+        self.download_target = None;
+        self.download_destination = None;
+        self.download_form = None;
+    }
+
+    fn begin_download(&mut self) {
+        self.mode = BrowserMode::Scanning;
+        self.message = self.planning_message().to_owned();
+        self.download = DownloadDisplay::default();
+        self.logs.clear();
+        self.log_filter = LogFilter::All;
+        self.log_offset_from_bottom = 0;
+        self.download_form = None;
+    }
+
+    fn return_to_browser(&mut self) {
+        self.mode = BrowserMode::Browsing;
+        self.message = "Ready".to_owned();
+        self.download_target = None;
+        self.download_destination = None;
+        self.download_form = None;
+    }
+
+    fn refresh_form_destination(&mut self) {
+        let Some(form) = self.download_form.as_ref() else {
+            return;
+        };
+        let Some(target) = self.download_target.as_ref() else {
+            return;
+        };
+        self.download_destination =
+            Some(self.selected_target_destination(Path::new(&form.destination_root), target));
+    }
+
+    fn handle_form_edit_key(&mut self, code: KeyCode) {
+        let Some(form) = self.download_form.as_mut() else {
+            return;
+        };
+        match form.field {
+            FormField::Destination => match code {
+                KeyCode::Left => form.cursor = form.cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    form.cursor = form
+                        .cursor
+                        .saturating_add(1)
+                        .min(form.destination_root.chars().count());
+                }
+                KeyCode::Home => form.cursor = 0,
+                KeyCode::End => form.cursor = form.destination_root.chars().count(),
+                KeyCode::Backspace if form.cursor > 0 => {
+                    remove_char(&mut form.destination_root, form.cursor - 1);
+                    form.cursor -= 1;
+                }
+                KeyCode::Delete if form.cursor < form.destination_root.chars().count() => {
+                    remove_char(&mut form.destination_root, form.cursor);
+                }
+                KeyCode::Char(character) => {
+                    insert_char(&mut form.destination_root, form.cursor, character);
+                    form.cursor += 1;
+                }
+                _ => {}
+            },
+            FormField::Workers => match code {
+                KeyCode::Left | KeyCode::Char('-') => {
+                    form.workers = form.workers.saturating_sub(1).max(1);
+                }
+                KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                    form.workers = form.workers.saturating_add(1).min(5);
+                }
+                KeyCode::Char(value @ '1'..='5') => {
+                    form.workers = value.to_digit(10).unwrap_or(1) as usize;
+                }
+                _ => {}
+            },
+        }
+        self.refresh_form_destination();
+    }
+
+    fn switch_tab(&mut self, forward: bool) {
+        self.active_tab = match (self.active_tab, forward) {
+            (AppTab::Files, true) | (AppTab::Settings, false) => AppTab::Logs,
+            (AppTab::Logs, true) | (AppTab::Files, false) => AppTab::Settings,
+            (AppTab::Settings, true) | (AppTab::Logs, false) => AppTab::Files,
+        };
+        if self.active_tab == AppTab::Settings && self.settings_form.is_none() {
+            self.settings_form = Some(SettingsForm::new(&self.network_settings));
+        }
+    }
+
+    fn focused_panel(&self) -> PanelFocus {
+        match self.active_tab {
+            AppTab::Files => self.files_focus,
+            AppTab::Logs => self.logs_focus,
+            AppTab::Settings => self.settings_focus,
+        }
+    }
+
+    fn switch_panel(&mut self) {
+        let focus = match self.focused_panel() {
+            PanelFocus::Upper => PanelFocus::Lower,
+            PanelFocus::Lower => PanelFocus::Upper,
+        };
+        match self.active_tab {
+            AppTab::Files => self.files_focus = focus,
+            AppTab::Logs => self.logs_focus = focus,
+            AppTab::Settings => self.settings_focus = focus,
+        }
+    }
+
+    fn handle_settings_edit_key(&mut self, code: KeyCode) {
+        let Some(form) = self.settings_form.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Left => form.cursor = form.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                form.cursor = form
+                    .cursor
+                    .saturating_add(1)
+                    .min(form.proxy.chars().count());
+            }
+            KeyCode::Home => form.cursor = 0,
+            KeyCode::End => form.cursor = form.proxy.chars().count(),
+            KeyCode::Backspace if form.cursor > 0 => {
+                remove_char(&mut form.proxy, form.cursor - 1);
+                form.cursor -= 1;
+            }
+            KeyCode::Delete if form.cursor < form.proxy.chars().count() => {
+                remove_char(&mut form.proxy, form.cursor);
+            }
+            KeyCode::Char(character) => {
+                insert_char(&mut form.proxy, form.cursor, character);
+                form.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn filtered_log_count(&self) -> usize {
+        self.logs
+            .iter()
+            .filter(|entry| self.log_filter.matches(entry.level))
+            .count()
+    }
+
+    fn handle_log_key(&mut self, code: &KeyCode) {
+        let max_offset = self.filtered_log_count().saturating_sub(1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.log_offset_from_bottom = self
+                    .log_offset_from_bottom
+                    .saturating_add(1)
+                    .min(max_offset);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.log_offset_from_bottom = self.log_offset_from_bottom.saturating_sub(1);
+            }
+            KeyCode::PageUp => {
+                self.log_offset_from_bottom = self
+                    .log_offset_from_bottom
+                    .saturating_add(self.page_step)
+                    .min(max_offset);
+            }
+            KeyCode::PageDown => {
+                self.log_offset_from_bottom =
+                    self.log_offset_from_bottom.saturating_sub(self.page_step);
+            }
+            KeyCode::Home => self.log_offset_from_bottom = max_offset,
+            KeyCode::End => self.log_offset_from_bottom = 0,
+            KeyCode::Char('a') => self.set_log_filter(LogFilter::All),
+            KeyCode::Char('i') => self.set_log_filter(LogFilter::Info),
+            KeyCode::Char('e') => self.set_log_filter(LogFilter::Error),
+            _ => {}
+        }
+    }
+
+    fn set_log_filter(&mut self, filter: LogFilter) {
+        self.log_filter = filter;
+        self.log_offset_from_bottom = 0;
+    }
+
+    fn apply_download_event(&mut self, event: DownloadEvent) {
+        match event {
+            DownloadEvent::Scanning {
+                job_id,
+                provider: _,
+            } => {
+                self.mode = BrowserMode::Scanning;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Scanning);
+                self.message = self.planning_message().to_owned();
+            }
+            DownloadEvent::PlanReady {
+                job_id,
+                provider: _,
+                files,
+                items,
+                bytes: _,
+                pre_skipped,
+                workers,
+            } => {
+                self.mode = BrowserMode::Downloading;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Running);
+                self.download.files = files;
+                self.download.items_total = items;
+                self.download.workers = workers;
+                self.download.pre_skipped = pre_skipped;
+                self.message = format!("Download plan ready: {items} items, {workers} workers");
+            }
+            DownloadEvent::TransferQueued {
+                job_id,
+                provider: _,
+                transfer_id,
+                path,
+                size,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| TransferDisplay::queued(transfer_id, path.clone(), size));
+                if !transfer.status.is_terminal() {
+                    transfer.path = path;
+                    transfer.total = size;
+                }
+            }
+            DownloadEvent::FileStarted {
+                job_id,
+                provider: _,
+                transfer_id,
+                index: _,
+                total: _,
+                path,
+                size,
+            } => {
+                self.mode = BrowserMode::Downloading;
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| TransferDisplay::queued(transfer_id, path.clone(), size));
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path;
+                transfer.status = TransferState::Running;
+                transfer.written = 0;
+                transfer.total = size;
+                transfer.bytes_per_second = 0.0;
+                transfer.detail = None;
+            }
+            DownloadEvent::Progress {
+                job_id,
+                provider: _,
+                transfer_id,
+                index: _,
+                total: _,
+                path,
+                file_written,
+                file_total,
+                bytes_per_second,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| {
+                        TransferDisplay::queued(transfer_id, path.clone(), file_total)
+                    });
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path;
+                transfer.status = TransferState::Running;
+                transfer.written = file_written;
+                transfer.total = file_total;
+                transfer.bytes_per_second = bytes_per_second;
+            }
+            DownloadEvent::FileSkipped {
+                job_id,
+                provider: _,
+                transfer_id,
+                path,
+                reason,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| TransferDisplay::queued(transfer_id, path.clone(), None));
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path.clone();
+                transfer.status = TransferState::Skipped;
+                transfer.bytes_per_second = 0.0;
+                transfer.detail = Some(reason.clone());
+                self.download.skipped += 1;
+                self.download.items_processed = self.download.items_processed.saturating_add(1);
+                self.download.last_issue = Some(format!("Skipped {}: {reason}", path.display()));
+            }
+            DownloadEvent::FileCompleted {
+                job_id,
+                provider: _,
+                transfer_id,
+                path,
+                bytes,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| {
+                        TransferDisplay::queued(transfer_id, path.clone(), Some(bytes))
+                    });
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path.clone();
+                transfer.status = TransferState::Completed;
+                transfer.written = bytes;
+                transfer.total = transfer.total.or(Some(bytes));
+                transfer.bytes_per_second = 0.0;
+                self.download.downloaded += 1;
+                self.download.items_processed = self.download.items_processed.saturating_add(1);
+                self.download.overall_written = self.download.overall_written.saturating_add(bytes);
+                self.download.last_issue = Some(format!(
+                    "Completed {} ({})",
+                    path.display(),
+                    format_bytes(bytes)
+                ));
+            }
+            DownloadEvent::FileFailed {
+                job_id,
+                provider: _,
+                transfer_id,
+                path,
+                bytes,
+                error,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| TransferDisplay::queued(transfer_id, path.clone(), None));
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path.clone();
+                transfer.status = TransferState::Failed;
+                transfer.written = bytes;
+                transfer.bytes_per_second = 0.0;
+                transfer.detail = Some(error.clone());
+                self.download.failed += 1;
+                self.download.items_processed = self.download.items_processed.saturating_add(1);
+                self.download.overall_written = self.download.overall_written.saturating_add(bytes);
+                self.download.partial_bytes = self.download.partial_bytes.saturating_add(bytes);
+                self.download.last_issue = Some(format!(
+                    "Failed {} after {}: {error}",
+                    path.display(),
+                    format_bytes(bytes)
+                ));
+            }
+            DownloadEvent::Finished {
+                job_id,
+                provider: _,
+                summary,
+            } => {
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Finished);
+                self.finish_download(summary);
+            }
+            DownloadEvent::Fatal {
+                job_id,
+                provider: _,
+                error,
+            } => {
+                self.mode = BrowserMode::Failed;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Failed);
+                self.download.fatal = Some(error);
+                self.message = "Download failed".to_owned();
+            }
+            DownloadEvent::Cancelled {
+                job_id,
+                provider: _,
+            } => {
+                self.mode = BrowserMode::Failed;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Cancelled);
+                for transfer in self.download.transfers.values_mut() {
+                    if !transfer.status.is_terminal() {
+                        transfer.status = TransferState::Interrupted;
+                        transfer.bytes_per_second = 0.0;
+                        transfer.detail = Some("cancelled".to_owned());
+                    }
+                }
+                self.message = "Download cancelled".to_owned();
+            }
+        }
+    }
+
+    fn finish_download(&mut self, summary: DownloadSummary) {
+        self.mode = BrowserMode::Finished;
+        self.download.downloaded = summary.downloaded;
+        self.download.skipped = summary.skipped;
+        self.download.failed = summary.failed;
+        self.download.overall_written = summary.bytes_written.saturating_add(summary.partial_bytes);
+        self.download.partial_bytes = summary.partial_bytes;
+        self.message = "Download finished".to_owned();
+    }
+
+    fn apply_download_snapshots(&mut self, snapshots: &[DownloadJobSnapshot]) {
+        let selected = self
+            .download
+            .job_id
+            .and_then(|job_id| snapshots.iter().find(|snapshot| snapshot.id == job_id))
+            .or_else(|| snapshots.iter().max_by_key(|snapshot| snapshot.id));
+        let Some(snapshot) = selected else {
+            return;
+        };
+        if self.download.job_id == Some(snapshot.id)
+            && self
+                .download
+                .state
+                .is_some_and(DownloadJobState::is_terminal)
+            && !snapshot.state.is_terminal()
+        {
+            return;
+        }
+        let mut display = DownloadDisplay {
+            job_id: Some(snapshot.id),
+            state: Some(snapshot.state),
+            files: snapshot.transfers.len(),
+            items_total: snapshot.transfers.len(),
+            workers: snapshot.request.options.concurrency,
+            fatal: snapshot.error.clone(),
+            ..DownloadDisplay::default()
+        };
+        for transfer in snapshot.transfers.values() {
+            display.transfers.insert(
+                transfer.id,
+                TransferDisplay {
+                    id: transfer.id,
+                    path: transfer.path.clone(),
+                    status: transfer.state,
+                    written: transfer.written,
+                    total: transfer.size,
+                    bytes_per_second: transfer.bytes_per_second,
+                    detail: transfer.error.clone(),
+                },
+            );
+        }
+        if self.download.job_id == Some(snapshot.id) {
+            for transfer in self.download.transfers.values() {
+                if transfer.status.is_terminal()
+                    && display
+                        .transfers
+                        .get(&transfer.id)
+                        .is_some_and(|current| !current.status.is_terminal())
+                {
+                    display.transfers.insert(transfer.id, transfer.clone());
+                }
+            }
+        }
+        display.items_processed = display
+            .transfers
+            .values()
+            .filter(|transfer| transfer.status.is_terminal())
+            .count();
+        display.downloaded = display.status_count(TransferState::Completed);
+        display.skipped = display.status_count(TransferState::Skipped);
+        display.failed = display.status_count(TransferState::Failed);
+        display.overall_written = display
+            .transfers
+            .values()
+            .filter(|transfer| {
+                matches!(
+                    transfer.status,
+                    TransferState::Completed | TransferState::Failed
+                )
+            })
+            .map(|transfer| transfer.written)
+            .sum();
+        display.partial_bytes = display
+            .transfers
+            .values()
+            .filter(|transfer| transfer.status == TransferState::Failed)
+            .map(|transfer| transfer.written)
+            .sum();
+        if let Some(summary) = &snapshot.summary {
+            display.downloaded = summary.downloaded;
+            display.skipped = summary.skipped;
+            display.failed = summary.failed;
+            display.overall_written = summary.bytes_written.saturating_add(summary.partial_bytes);
+            display.partial_bytes = summary.partial_bytes;
+        }
+        self.download = display;
+        match snapshot.state {
+            DownloadJobState::Queued | DownloadJobState::Scanning => {
+                self.mode = BrowserMode::Scanning;
+                self.message = format!("Job {} is planning", snapshot.id.0);
+            }
+            DownloadJobState::Running => {
+                self.mode = BrowserMode::Downloading;
+                self.message = format!("Job {} is downloading", snapshot.id.0);
+            }
+            DownloadJobState::Finished => {
+                self.mode = BrowserMode::Finished;
+                self.message = format!("Job {} finished", snapshot.id.0);
+            }
+            DownloadJobState::Failed => {
+                self.mode = BrowserMode::Failed;
+                self.message = format!("Job {} failed", snapshot.id.0);
+            }
+            DownloadJobState::Cancelled => {
+                self.mode = BrowserMode::Failed;
+                self.message = format!("Job {} was cancelled", snapshot.id.0);
+            }
+            DownloadJobState::Interrupted => {
+                self.mode = BrowserMode::Failed;
+                self.message = format!("Job {} is interrupted", snapshot.id.0);
+            }
+        }
+    }
+}
+
+fn char_byte_index(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+fn insert_char(value: &mut String, char_index: usize, character: char) {
+    let byte_index = char_byte_index(value, char_index);
+    value.insert(byte_index, character);
+}
+
+fn remove_char(value: &mut String, char_index: usize) {
+    let start = char_byte_index(value, char_index);
+    let end = char_byte_index(value, char_index.saturating_add(1));
+    if start < end {
+        value.replace_range(start..end, "");
+    }
+}
+
+fn with_cursor(value: &str, char_index: usize) -> String {
+    let mut displayed = value.to_owned();
+    let byte_index = char_byte_index(&displayed, char_index);
+    displayed.insert(byte_index, '▏');
+    displayed
+}

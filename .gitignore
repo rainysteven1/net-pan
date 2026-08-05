@@ -1,0 +1,15 @@
+/target/
+
+# Local credentials and environment files
+.env
+.env.*
+credentials*.json
+service-account*.json
+*.pem
+*.key
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+.DS_Store
