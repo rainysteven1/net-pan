@@ -1,6 +1,6 @@
-# pan-tui
+# net-pan
 
-`pan-tui` is a Rust terminal downloader for cloud-drive folders. The goal is a small TUI that lets
+`net-pan` is a Rust terminal downloader for cloud-drive folders. The goal is a small TUI that lets
 you open saved netdisk sources, browse one level at a time, and download the highlighted item to a
 local directory.
 
@@ -15,17 +15,18 @@ The app is no longer tied to a JuiceFS mount. The default destination is `~/Down
 ## Features
 
 - Saved source registry; no link is required on the command line
-- `Shared links` virtual level with a visible saved-link count
-- Level-by-level Ratatui browser with breadcrumbs and file details
+- `Sources` virtual entry level with a visible source count
+- Level-by-level Ratatui browser with middle-collapsed breadcrumbs
 - Download of the highlighted folder or regular file, preserving the saved-root hierarchy
 - Streaming writes through same-directory `.part` files
 - HTTP Range resume, size validation, `sync_all`, and atomic final rename
 - Multi-row transfer progress with per-file and aggregate speeds
 - Overall item-count percentage independent of file sizes
-- Download form with an editable destination root and 1-5 concurrent file workers
+- One validated global download root plus a read-only target preview and 1-5 concurrent file workers
 - Loguru-style session logs with date directories and size rotation
-- `Files / Logs / Settings` tabs with independent upper/lower panel focus
-- Runtime Provider/Profile/Source selector with independent browser sessions per Source
+- Left-side `Accounts / Files / Transfers / Logs / Settings` navigation
+- Top-shell destination and a cc-switch-style contextual shortcut bar
+- Header Provider Type switching, custom Account names, and independent browser sessions per Source
 - Schema-driven Provider settings with masked secrets and isolated instance rebuilds
 - Safe local names and deterministic handling of duplicate remote names
 - Per-file error handling: one failed file does not stop the remaining plan
@@ -45,6 +46,16 @@ The app is no longer tied to a JuiceFS mount. The default destination is `~/Down
 
 ## Google Drive Setup
 
+Every Provider Account has a generated stable ID such as `p_zr6bktv5`. The user-facing Account
+name is editable and does not affect paths or existing Jobs. Account files are isolated under:
+
+```text
+~/.net-pan/providers/google/<PROFILE_ID>/
+```
+
+Start the TUI, open `Accounts`, and press `n` to create another Google Account. The initial run also
+creates one disabled draft Account for each built-in Provider.
+
 ### Installed App OAuth
 
 1. Enable the Google Drive API in a Google Cloud project.
@@ -52,33 +63,34 @@ The app is no longer tied to a JuiceFS mount. The default destination is `~/Down
    privately:
 
    ```bash
-   install -d -m 700 ~/.config/pan-tui/providers/google
+   install -d -m 700 ~/.net-pan/providers/google/PROFILE_ID
    install -m 600 /path/to/client_secret.json \
-     ~/.config/pan-tui/providers/google/oauth-client.json
+     ~/.net-pan/providers/google/PROFILE_ID/oauth-client.json
    ```
 
-3. Configure `~/.config/pan-tui/providers/google.toml`:
+3. Configure `~/.net-pan/providers/google/PROFILE_ID/config.toml`:
 
    ```toml
+   name = "Personal Google"
    enabled = true
    auth_mode = "installed_app"
-   credentials_file = "google/oauth-client.json"
-   token_file = "google/oauth-token.json"
-   sources_file = "google/sources.json"
+   credentials_file = "oauth-client.json"
+   token_file = "token.json"
+   sources_file = "sources.json"
    ```
 
 4. Create the sources file as shown below, then complete the first login:
 
    ```bash
-   pan-tui auth login google
-   pan-tui auth status google
+   net-pan auth login google PROFILE_ID
+   net-pan auth status google --profile PROFILE_ID
    ```
 
 The login command prints Google's authorization URL and listens on a temporary
 `127.0.0.1` callback port for up to five minutes. It uses Authorization Code + PKCE and persists
 the access/refresh token state atomically with mode `0600`. Refresh-token rotation is saved before
-the refreshed access token is returned to callers. Use `pan-tui auth revoke google` to remove the
-local token state.
+the refreshed access token is returned to callers. Use
+`net-pan auth revoke google PROFILE_ID` to remove that Account's local token state.
 
 ### Service Account
 
@@ -88,12 +100,12 @@ local token state.
 4. Store the key outside this repository and restrict its permissions:
 
    ```bash
-   install -d -m 700 ~/.config/pan-tui/providers/google
+   install -d -m 700 ~/.net-pan/providers/google/PROFILE_ID
    install -m 600 /path/to/downloaded-key.json \
-     ~/.config/pan-tui/providers/google/service-account.json
+     ~/.net-pan/providers/google/PROFILE_ID/service-account.json
    ```
 
-5. Save the shared folder links in `~/.config/pan-tui/providers/google/sources.json`:
+5. Save the shared folder links in `~/.net-pan/providers/google/PROFILE_ID/sources.json`:
 
    ```json
    {
@@ -105,32 +117,22 @@ local token state.
    ```
 
    ```bash
-   chmod 600 ~/.config/pan-tui/providers/google/sources.json
+   chmod 600 ~/.net-pan/providers/google/PROFILE_ID/sources.json
    ```
 
-6. Create `~/.config/pan-tui/providers/google.toml` with mode `0600`:
+6. Create `~/.net-pan/providers/google/PROFILE_ID/config.toml` with mode `0600`:
 
    ```toml
+   name = "Work Google"
    enabled = true
    auth_mode = "service_account"
-   credentials_file = "google/service-account.json"
-   sources_file = "google/sources.json"
+   credentials_file = "service-account.json"
+   token_file = "token.json"
+   sources_file = "sources.json"
    ```
 
-CLI/environment overrides select Service Account mode. The application resolves those Google
-credentials in this order:
-
-1. `--credentials <PATH>`
-2. `GOOGLE_APPLICATION_CREDENTIALS`
-3. `~/.config/pan-tui/providers/google/service-account.json`
-
-It resolves the sources file in this order:
-
-1. `--sources <PATH>`
-2. `PAN_TUI_SOURCES`
-3. `~/.config/pan-tui/providers/google/sources.json`
-
-The legacy top-level files remain readable and are not deleted automatically.
+Google configuration is loaded only from the selected Account directory. Relative credential,
+token, and sources paths are resolved inside that directory.
 
 Duplicate folder IDs are collapsed. Each saved source is validated at startup and must currently be
 a Google Drive folder that the service account can read.
@@ -140,9 +142,11 @@ the download destination.
 
 ## Aliyun Drive Setup
 
-Create `~/.config/pan-tui/providers/aliyun.toml` with mode `0600`:
+Create an Aliyun Account in the TUI, then edit
+`~/.net-pan/providers/aliyun/PROFILE_ID/config.toml` with mode `0600`:
 
 ```toml
+name = "Personal Aliyun"
 enabled = true
 client_id = "YOUR_OPENAPI_CLIENT_ID"
 refresh_token = "YOUR_INITIAL_REFRESH_TOKEN"
@@ -157,7 +161,7 @@ root_file_id = "root"
 ```
 
 The provider uses the personal-drive OpenAPI at `https://openapi.alipan.com`. Rotated access and
-refresh tokens are atomically persisted to `~/.config/pan-tui/providers/aliyun/token.json` with
+refresh tokens are atomically persisted to the same Account directory as `token.json` with
 mode `0600`. Signed download URLs and token response bodies are not written to logs.
 
 Folder creation, upload, delete, and asynchronous task operations are part of the common Provider
@@ -177,13 +181,11 @@ Start the interactive browser with the default destination:
 cargo run --release
 ```
 
-Choose explicit configuration files and a destination:
+Choose an initial Provider and destination:
 
 ```bash
 cargo run --release -- \
   --provider google \
-  --credentials ~/.config/pan-tui/service-account.json \
-  --sources ~/.config/pan-tui/sources.json \
   --destination ~/Downloads
 ```
 
@@ -207,26 +209,29 @@ Use `--no-resume` to restart `.part` files instead of sending a Range request. R
 Start the long-lived runtime:
 
 ```bash
-pan-tui daemon
+net-pan daemon
 ```
 
-Query or cancel Jobs through the private local Unix socket:
+Query, pause, resume, or stop Jobs through the private local Unix socket:
 
 ```bash
-pan-tui status
-pan-tui cancel 42
+net-pan status
+net-pan pause 42
+net-pan resume 42
+net-pan cancel 42
 ```
 
 Provider browsing and script submission use the same daemon-owned Provider instances as the TUI:
 
 ```bash
-pan-tui providers
-pan-tui sources google
-pan-tui ls google SOURCE_ID FOLDER_OBJECT_ID
-pan-tui stat google SOURCE_ID OBJECT_ID
-pan-tui download google SOURCE_ID OBJECT_ID /absolute/local/destination --workers 2
-pan-tui job 42
-pan-tui watch
+net-pan providers
+net-pan sources google --profile PROFILE_ID
+net-pan ls google SOURCE_ID FOLDER_OBJECT_ID --profile PROFILE_ID
+net-pan stat google SOURCE_ID OBJECT_ID --profile PROFILE_ID
+net-pan download google SOURCE_ID OBJECT_ID /absolute/local/destination \
+  --profile PROFILE_ID --workers 2
+net-pan job 42
+net-pan watch
 ```
 
 These commands emit JSON (`watch` emits JSON Lines). Provider, Source, and object IDs are opaque;
@@ -239,11 +244,12 @@ does not stop those Jobs. When no socket exists, the TUI uses an embedded foregr
 existing but unusable socket is reported as an error instead of opening the same SQLite database
 from a second runtime.
 
-IPC protocol v3 carries provider-neutral catalog, Source, `RemoteRef`, masked settings, and Job DTOs.
+IPC protocol v5 carries provider-neutral Account catalog, Source, `RemoteRef`, masked settings, Job
+DTOs, and pause/resume controls.
 It persists idempotency mappings for `client_id + request_id` in the same transaction
 as the Job. A repeated matching request returns the original Job ID; reusing the key with different
 request JSON is rejected. Subscription startup always sends a complete snapshot, including after a
-daemon restart where the in-memory revision counter starts over. `pan-tui submit <REQUEST.json>` is
+daemon restart where the in-memory revision counter starts over. `net-pan submit <REQUEST.json>` is
 the low-level IPC/debug client and accepts an optional `--request-id`.
 
 The binary is only the CLI adapter for this path. `DaemonService` owns Provider instances, recovery,
@@ -251,13 +257,13 @@ the download runtime, notification worker, and socket lifecycle. TUI and CLI use
 without a socket the TUI swaps in `EmbeddedPanClient`. Both implement the same `PanClient`
 contract, and only the IPC module constructs versioned wire requests.
 
-An example user service is available at `contrib/pan-tui.service`. Install the binary at
-`~/.local/bin/pan-tui`, place the unit under `~/.config/systemd/user/`, then enable it with
-`systemctl --user enable --now pan-tui.service`.
+An example user service is available at `contrib/net-pan.service`. Install the binary at
+`~/.local/bin/net-pan`, place the unit under `~/.config/systemd/user/`, then enable it with
+`systemctl --user enable --now net-pan.service`.
 
 ## Notifications
 
-The daemon loads `~/.config/pan-tui/notifiers.toml`. Restrict it to mode `0600`:
+The daemon loads `~/.net-pan/notifiers.toml`. Restrict it to mode `0600`:
 
 ```toml
 [notifiers.dingtalk]
@@ -282,17 +288,24 @@ URLs, secrets, signatures, and signed download URLs are not written to Job histo
 
 | Key | Action |
 |---|---|
-| `[` / `]` | Switch among `Files`, `Logs`, and `Settings` |
-| `Tab` / `Shift-Tab` | Switch the upper/lower panel inside the current tab |
-| `p` | Open the Provider/Profile/Source selector |
+| `[` / `]` | Switch Provider Type while restoring its last active Account |
+| `Left` / `Right` | Move between Navigation and the current page |
+| `Up` / `Down`, then `Enter` | Select and open a Navigation route |
+| `Tab` / `Shift-Tab` | Switch subpanes only on pages that contain multiple panes |
+| `g` | Open the separate Global Settings layer |
+| `Backspace` | Return from Global Settings or the current breadcrumb level |
+| `p` | Open the current Account's Source selector from Files |
 | `q` / `Ctrl-C` | Open the shared exit confirmation |
 
-Inside the selector, use `Left` / `Right` to choose a Provider/Profile, `Up` / `Down` to choose a
-Source, `Enter` to activate it, and `Esc` to cancel. Each Source restores its own directory stack,
+The left Navigation contains `Accounts`, `Files`, `Transfers`, `Logs`, and `Settings`. On Accounts,
+use `Up` / `Down` to select an Account, `Enter` to open `Accounts / <account>` in place, `Space` to
+activate it, and `a` to create one with a custom name. `Backspace` returns from Account
+details to the list. The Settings route always edits the current Provider Account. Inside the Source
+selector, use `Up` / `Down`, `Enter`, and `Esc`. Each Source restores its own directory stack,
 selected item, list offset, and last status/error. Switching does not replace the Provider instance
 held by an active download job.
 
-### `Shared links` level
+### `Sources` level
 
 | Key | Action |
 |---|---|
@@ -301,8 +314,8 @@ held by an active download job.
 | `PageUp` / `PageDown` | Move by one page |
 | `Home` / `End` | Select the first or last item |
 | `Enter` | Open the selected saved link |
-| `d` | Download the highlighted shared folder recursively |
-| `r` | Reload the sources file and saved-link metadata |
+| `d` | Download the highlighted source folder recursively |
+| `r` | Reload source metadata |
 
 ### Real folder level
 
@@ -311,7 +324,7 @@ held by an active download job.
 | `Up` / `k`, `Down` / `j` | Move the selection |
 | `PageUp` / `PageDown`, `Home` / `End` | Move by a page or jump to an edge |
 | `Enter` / `Right` | Open the highlighted child folder; hidden for other item types |
-| `Backspace` / `Left` | Return to the parent level |
+| `Backspace` | Return to the parent level |
 | `r` | Reload the current folder's direct children |
 | `d` | Download the highlighted folder or downloadable regular file |
 
@@ -319,16 +332,25 @@ held by an active download job.
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` | Switch between destination and worker fields |
-| Text, `Backspace`, `Delete`, `Left`, `Right`, `Home`, `End` | Edit the destination root |
 | `Left` / `Right`, `-` / `+`, `1`-`5` | Adjust concurrent file workers |
-| `Enter` | Validate the form and start the download |
+| `Enter` | Validate the global root and start the download |
 | `Esc` | Cancel the form |
 | `q` / `Ctrl-C` | Open the shared exit confirmation |
 
-The destination root defaults to the CLI destination (`~/Downloads` unless overridden) and must be
-an absolute path. The target preview combines that root with the complete path from the saved source
-root to the highlighted item. File workers default to `1` and are clamped to `1`-`5`.
+The destination is the single global download root configured in the upper Settings panel. It must
+be an existing absolute directory and cannot be a symbolic link. The form shows it read-only and
+combines it with the complete path from the saved source root to the highlighted item. A selected
+folder is downloaded as a complete tree below that root. File workers default to `1` and are
+clamped to `1`-`5`.
+
+### Transfers
+
+Each row renders a width-aware combined progress value such as
+`[############--------] 60% 140.1MB/233.5MB`. Narrow layouts shorten the bar and hide the separate
+speed column before truncating the percentage or byte counts. Use `Space` to pause or resume the
+current Job and `x` to stop it. Pausing retains `.part` files and the original Job ID; stopping is a
+manual failure shown as `STOP` and written at `ERROR` level. The selected Transfer's complete path
+and error chain are shown in the Detail area instead of replacing its progress cell.
 
 ### Logs Tab
 
@@ -340,6 +362,7 @@ root to the highlighted item. File workers default to `1` and are clamped to `1`
 | `a` | Show all levels |
 | `i` | Show `INFO` entries |
 | `e` | Show `ERROR` entries |
+| `Tab` / `Shift-Tab` | Switch between the log list and detail pane |
 
 ## Download Behavior
 
@@ -358,38 +381,51 @@ path.
 
 ## Local State And Logs
 
-Persistent runtime files share one `pan-tui` state root:
+Persistent runtime files share one `net-pan` state root:
 
 ```text
-~/.local/state/pan-tui/state.db
-~/.local/state/pan-tui/state.db-wal
-~/.local/state/pan-tui/state.db-shm
-~/.local/state/pan-tui/client-id
-~/.local/state/pan-tui/logs/
+~/.net-pan/settings.toml
+~/.net-pan/providers/<provider>/<profile>/config.toml
+~/.net-pan/state/state.db
+~/.net-pan/state/state.db-wal
+~/.net-pan/state/state.db-shm
+~/.net-pan/state/client-id
+~/.net-pan/state/net-pan.sock
+~/.net-pan/logs/
 ```
 
-`XDG_STATE_HOME` replaces `~/.local/state` when set. The directory is restricted to mode `0700`;
-the database, stable IPC client ID, socket, and log files use private permissions. Provider and
-Notifier configuration remains under `~/.config/pan-tui` and is not stored in SQLite.
+Directories are restricted to mode `0700`; configuration, credentials, tokens, the database,
+stable IPC client ID, socket, and log files use private permissions. Secrets are not stored in
+SQLite.
 
 Each process writes immediately flushed, Loguru-style lines under:
 
 ```text
-~/.local/state/pan-tui/logs/YYYY-MM-DD/pan-tui_HH-mm-ss_000.log
+~/.net-pan/logs/YYYY-MM-DD/net-pan_HH-mm-ss_000.log
 ```
 
 Files rotate at 10 MiB by incrementing the final number. Planning, file starts, completed files,
 skipped files, and summaries use `INFO`; failed files and fatal errors use `ERROR`.
 
-## Network Settings
+## Global Settings
 
-Open the `Settings` tab with `[` / `]`, focus the upper panel, and press `Enter` to edit the
-application proxy. Enter an absolute HTTP or HTTPS proxy URL, then press `Enter` to save and
-reconnect. Clear the field to connect directly. `Esc` stops editing.
+Press `g` from any non-editing context to open the separate Global Settings layer. The editable
+table contains only `Download path` and `Proxy URL`; connection mode, proxy precedence, and
+environment policy are shown separately as read-only information. Use `Up` / `Down` to select a
+field, `Enter` to start editing, and `Ctrl-S` to save. The download path must be an
+existing absolute real directory; relative, missing, regular-file, and symbolic-link paths are
+rejected. Saving it changes the root used by every subsequent Job. Enter an absolute HTTP or HTTPS
+proxy URL, or clear it for a direct connection; changing the proxy reconnects Providers. `Esc`
+stops editing, and `Backspace` returns from the layer when no field is being edited.
+Successful saves keep the Settings page open, leave editing mode, and show a centered confirmation
+Toast for two seconds. Validation and write failures keep the field in editing mode.
 
-The setting is stored with restricted permissions in `~/.config/pan-tui/config.toml`:
+The setting is stored with restricted permissions in `~/.net-pan/settings.toml`:
 
 ```toml
+[download]
+destination = "/home/user/Downloads"
+
 [network]
 proxy = "http://127.0.0.1:7890"
 ```
@@ -398,11 +434,13 @@ OAuth and provider API/download clients use this setting. The application explic
 `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`; when `proxy` is absent or blank, requests connect
 directly.
 
-Focus the lower Settings panel with `Tab` to edit fields supplied by the current
-`ProviderFactory::settings_schema()`. Use `Up` / `Down` to choose a field, `Enter` to edit and save,
-and `Space` to toggle booleans. Secret values are always masked; leaving an existing secret blank
+The Settings navigation route displays fields supplied by the current
+`ProviderFactory::settings_schema()`. Use `Up` / `Down` to choose a field, `Enter` to start editing,
+`Ctrl-S` to save and rebuild, and `Space` to toggle booleans. Secret values are always masked; leaving an existing secret blank
 keeps it unchanged. Saving rebuilds only that Provider. If reconnect fails, the previous instance
-and edited input remain available.
+and edited input remain available. Editable Provider fields and read-only Action/derived fields are
+rendered in separate `EDITABLE SETTINGS` and `READ ONLY` sections; selection never enters read-only
+rows. Provider saves use the same centered two-second Toast behavior.
 
 ## Known Limits
 
@@ -422,3 +460,7 @@ cargo build --release
 
 The architecture and gated implementation record are maintained in [DESIGN.md](DESIGN.md) and
 [TODO.md](TODO.md). Those two planning documents are intentionally written in Chinese.
+
+The TUI shell and interaction hierarchy adapt MIT-licensed layout patterns from
+[`cc-switch-cli`](https://github.com/saladday/cc-switch-cli). See
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) for attribution and license terms.
