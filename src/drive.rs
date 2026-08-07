@@ -34,7 +34,7 @@ impl DriveClient {
             .configure_client(reqwest::Client::builder())?
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(120))
-            .user_agent(concat!("pan-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("net-pan/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to create HTTP client")?;
         Ok(Self {

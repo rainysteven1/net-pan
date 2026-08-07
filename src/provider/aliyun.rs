@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::{
     config::ProviderConfigStore,
     provider::{
-        CloudProvider, DownloadCapability, ProfileId, ProviderCapabilities, ProviderContext,
+        CloudProvider, DownloadCapability, ProviderCapabilities, ProviderContext,
         ProviderDriveInfo, ProviderError, ProviderErrorKind, ProviderFactory, ProviderId,
         ProviderIdentity, ProviderReadiness, ProviderResult, ProviderSettingKind,
         ProviderSettingSpec, ProviderSettingsSnapshot, ProviderUserInfo, RemoteChecksum,
@@ -23,7 +23,10 @@ const DEFAULT_API_BASE: &str = "https://openapi.alipan.com";
 const TOKEN_STATE_FILE: &str = "token.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AliyunProviderConfig {
+    #[serde(default)]
+    pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub client_id: String,
@@ -46,6 +49,7 @@ pub struct AliyunProviderConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AliyunSourceConfig {
     pub id: String,
     #[serde(default)]
@@ -71,18 +75,18 @@ struct TokenStore {
     client_secret: Option<String>,
     bootstrap_refresh_token: Option<String>,
     config_store: ProviderConfigStore,
-    provider_id: ProviderId,
+    identity: ProviderIdentity,
 }
 
 impl TokenStore {
     fn new(
         config_store: ProviderConfigStore,
-        provider_id: ProviderId,
+        identity: ProviderIdentity,
         config: &AliyunProviderConfig,
         client: reqwest::Client,
     ) -> ProviderResult<Self> {
         let state = config_store
-            .read_private_file(&provider_id, TOKEN_STATE_FILE)
+            .read_private_file(&identity, TOKEN_STATE_FILE)
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))?
             .map(|contents| {
                 serde_json::from_slice(&contents).map_err(|error| {
@@ -112,7 +116,7 @@ impl TokenStore {
             client_secret: config.client_secret.clone(),
             bootstrap_refresh_token: config.refresh_token.clone(),
             config_store,
-            provider_id,
+            identity,
         })
     }
 
@@ -179,7 +183,7 @@ impl TokenStore {
         let contents = serde_json::to_vec_pretty(&next)
             .map_err(|error| provider_error(ProviderErrorKind::Internal, error))?;
         self.config_store
-            .write_private_file_atomic(&self.provider_id, TOKEN_STATE_FILE, &contents)
+            .write_private_file_atomic(&self.identity, TOKEN_STATE_FILE, &contents)
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))?;
         *state = next;
         Ok(state.access_token.clone())
@@ -289,67 +293,87 @@ impl ProviderFactory for AliyunProviderFactory {
     fn settings_schema(&self) -> Vec<ProviderSettingSpec> {
         vec![
             ProviderSettingSpec {
+                key: "name",
+                label: "Account name",
+                description: "User-defined Account name shown in net-pan; changing it does not change the stable ProfileId or stored Jobs.",
+                kind: ProviderSettingKind::Text,
+                required: true,
+            },
+            ProviderSettingSpec {
                 key: "enabled",
                 label: "Enabled",
+                description: "Enables this Aliyun Drive Provider; disable it to stop connecting without deleting its configuration.",
                 kind: ProviderSettingKind::Boolean,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "client_id",
                 label: "OpenAPI client ID",
+                description: "Client ID issued to the Aliyun Drive enterprise OpenAPI application.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "client_secret",
                 label: "OpenAPI client secret",
+                description: "Optional application secret; stored privately and masked after it has been configured.",
                 kind: ProviderSettingKind::Secret,
                 required: false,
             },
             ProviderSettingSpec {
                 key: "refresh_token",
                 label: "OpenAPI refresh token",
+                description: "OAuth refresh token used to obtain access tokens; rotations are persisted atomically with 0600 permissions.",
                 kind: ProviderSettingKind::Secret,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "drive",
                 label: "Drive kind",
+                description: "Aliyun drive to browse, such as default, resource, or backup, as allowed by the account.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "root_file_id",
                 label: "Default root file ID",
+                description: "Remote folder ID used as the default saved-link root; root selects the drive root.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "sources",
                 label: "Saved folders",
+                description: "Summary of configured Aliyun saved links shown in Files before a Source is opened.",
                 kind: ProviderSettingKind::Action,
                 required: false,
             },
             ProviderSettingSpec {
                 key: "proxy",
                 label: "Provider proxy",
+                description: "Overrides the global application proxy for Aliyun Drive; blank inherits it. System proxy environment variables are ignored.",
                 kind: ProviderSettingKind::Text,
                 required: false,
             },
             ProviderSettingSpec {
                 key: "api_base",
                 label: "OpenAPI base URL",
+                description: "Aliyun Drive OpenAPI endpoint; keep the official default unless testing against a controlled mock server.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             },
         ]
     }
 
-    fn load_settings(&self, context: &ProviderContext) -> ProviderResult<ProviderSettingsSnapshot> {
-        let config = load_config(context)?.unwrap_or_else(default_editable_config);
+    fn load_settings(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderResult<ProviderSettingsSnapshot> {
+        let config = load_config(context, identity)?.unwrap_or_else(default_editable_config);
         let store = ProviderConfigStore::new(context.config_root.clone());
         let token_state_exists = store
-            .read_private_file(&aliyun_id(), TOKEN_STATE_FILE)
+            .read_private_file(identity, TOKEN_STATE_FILE)
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))?
             .is_some();
         let mut configured_secrets = std::collections::BTreeSet::new();
@@ -369,6 +393,14 @@ impl ProviderFactory for AliyunProviderFactory {
             configured_secrets.insert("refresh_token".to_owned());
         }
         let values = BTreeMap::from([
+            (
+                "name".to_owned(),
+                if config.name.trim().is_empty() {
+                    identity.profile_id.to_string()
+                } else {
+                    config.name
+                },
+            ),
             ("enabled".to_owned(), config.enabled.to_string()),
             ("client_id".to_owned(), config.client_id),
             ("client_secret".to_owned(), String::new()),
@@ -385,25 +417,20 @@ impl ProviderFactory for AliyunProviderFactory {
         Ok(ProviderSettingsSnapshot {
             values,
             configured_secrets,
-            read_only_reason: context
-                .config_overrides
-                .contains_key(&aliyun_id())
-                .then(|| "Aliyun settings are overridden for this run".to_owned()),
+            read_only_reason: None,
         })
     }
 
     fn save_settings(
         &self,
         context: &ProviderContext,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> ProviderResult<()> {
-        if context.config_overrides.contains_key(&aliyun_id()) {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Config,
-                "Aliyun settings are read-only while runtime overrides are active",
-            ));
+        let mut config = load_config(context, identity)?.unwrap_or_else(default_editable_config);
+        if let Some(value) = changes.get("name") {
+            config.name = validate_account_name(value)?;
         }
-        let mut config = load_config(context)?.unwrap_or_else(default_editable_config);
         if let Some(value) = changes.get("enabled") {
             config.enabled = parse_bool_setting("enabled", value)?;
         }
@@ -439,33 +466,36 @@ impl ProviderFactory for AliyunProviderFactory {
         }
         let contents = toml::to_string_pretty(&config)
             .map_err(|error| provider_error(ProviderErrorKind::Internal, error))?;
-        let mut validation_context = context.clone();
-        validation_context
-            .config_overrides
-            .insert(aliyun_id(), contents.as_bytes().to_vec());
-        load_config(&validation_context)?;
         let store = ProviderConfigStore::new(context.config_root.clone());
         store
-            .write_config(&aliyun_id(), contents.as_bytes())
+            .write_config(identity, contents.as_bytes())
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))?;
         if refresh_changed {
             store
-                .remove_private_file(&aliyun_id(), TOKEN_STATE_FILE)
+                .remove_private_file(identity, TOKEN_STATE_FILE)
                 .map_err(|error| provider_error(ProviderErrorKind::Config, error))?;
         }
         Ok(())
     }
 
-    fn readiness(&self, context: &ProviderContext) -> ProviderReadiness {
-        match load_config(context) {
+    fn readiness(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderReadiness {
+        match load_config(context, identity) {
             Ok(Some(config)) if !config.enabled => ProviderReadiness::Disabled,
             Ok(Some(_)) | Err(_) => ProviderReadiness::ReadyToConnect,
             Ok(None) => ProviderReadiness::NeedsConfig,
         }
     }
 
-    async fn create(&self, context: ProviderContext) -> ProviderResult<Arc<dyn CloudProvider>> {
-        let config = load_config(&context)?.ok_or_else(|| {
+    async fn create(
+        &self,
+        context: ProviderContext,
+        identity: ProviderIdentity,
+    ) -> ProviderResult<Arc<dyn CloudProvider>> {
+        let config = load_config(&context, &identity)?.ok_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::Config,
                 "Aliyun provider is not configured",
@@ -477,6 +507,7 @@ impl ProviderFactory for AliyunProviderFactory {
                 "Aliyun provider is disabled",
             ));
         }
+        validate_runtime_config(&config)?;
         let network = effective_network(&context, &config)?;
         let http = network
             .configure_client(reqwest::Client::builder())
@@ -484,9 +515,14 @@ impl ProviderFactory for AliyunProviderFactory {
             .build()
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))?;
         let store = ProviderConfigStore::new(context.config_root.clone());
-        let token = Arc::new(TokenStore::new(store, aliyun_id(), &config, http.clone())?);
+        let token = Arc::new(TokenStore::new(
+            store,
+            identity.clone(),
+            &config,
+            http.clone(),
+        )?);
         let provider = AliyunProvider {
-            identity: ProviderIdentity::new(aliyun_id(), ProfileId::new("default").unwrap()),
+            identity,
             http,
             api_base: config.api_base.trim_end_matches('/').to_owned(),
             token,
@@ -1022,35 +1058,39 @@ fn is_expired_token_code(code: &str) -> bool {
     matches!(code, "AccessTokenInvalid" | "AccessTokenExpired" | "I400JD")
 }
 
-fn load_config(context: &ProviderContext) -> ProviderResult<Option<AliyunProviderConfig>> {
-    let id = aliyun_id();
+fn load_config(
+    context: &ProviderContext,
+    identity: &ProviderIdentity,
+) -> ProviderResult<Option<AliyunProviderConfig>> {
     let store = ProviderConfigStore::new(context.config_root.clone());
-    let contents = if let Some(contents) = context.config_overrides.get(&id) {
-        contents.clone()
-    } else {
-        let Some(contents) = store
-            .read_config(&id)
-            .map_err(|error| provider_error(ProviderErrorKind::Config, error))?
-        else {
-            return Ok(None);
-        };
-        contents
+    let Some(contents) = store
+        .read_config(identity)
+        .map_err(|error| provider_error(ProviderErrorKind::Config, error))?
+    else {
+        return Ok(None);
     };
     if contents.is_empty() {
         return Ok(None);
     }
-    let text = std::str::from_utf8(&contents).map_err(|_| {
+    parse_config(&contents).map(Some)
+}
+
+fn parse_config(contents: &[u8]) -> ProviderResult<AliyunProviderConfig> {
+    let text = std::str::from_utf8(contents).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::Config,
             "Aliyun provider config is not UTF-8",
         )
     })?;
-    let config: AliyunProviderConfig = toml::from_str(text).map_err(|error| {
+    toml::from_str(text).map_err(|error| {
         ProviderError::new(
             ProviderErrorKind::Config,
             format!("invalid Aliyun provider config: {error}"),
         )
-    })?;
+    })
+}
+
+fn validate_runtime_config(config: &AliyunProviderConfig) -> ProviderResult<()> {
     if config.client_id.trim().is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::Config,
@@ -1092,7 +1132,7 @@ fn load_config(context: &ProviderContext) -> ProviderResult<Option<AliyunProvide
             ));
         }
     }
-    Ok(Some(config))
+    Ok(())
 }
 
 fn effective_network(
@@ -1101,6 +1141,7 @@ fn effective_network(
 ) -> ProviderResult<crate::settings::NetworkSettings> {
     let network = match config.proxy.as_deref() {
         None => context.network.clone(),
+        Some(value) if value.trim().is_empty() => context.network.clone(),
         Some(value) => crate::settings::NetworkSettings::from_proxy_input(value),
     };
     network
@@ -1131,7 +1172,8 @@ fn default_api_base() -> String {
 
 fn default_editable_config() -> AliyunProviderConfig {
     AliyunProviderConfig {
-        enabled: true,
+        name: String::new(),
+        enabled: false,
         client_id: String::new(),
         client_secret: None,
         refresh_token: None,
@@ -1142,6 +1184,23 @@ fn default_editable_config() -> AliyunProviderConfig {
         api_base: default_api_base(),
         sources: Vec::new(),
     }
+}
+
+fn validate_account_name(value: &str) -> ProviderResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name cannot be blank",
+        ));
+    }
+    if value.chars().count() > 64 || value.chars().any(char::is_control) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name must be at most 64 characters and contain no control characters",
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_bool_setting(key: &str, value: &str) -> ProviderResult<bool> {
@@ -1290,12 +1349,17 @@ mod tests {
             "enabled = true\nclient_id = \"client-1\"\nrefresh_token = \"refresh-1\"\napi_base = \"{base}\"\n{sources}"
         );
         let id = aliyun_id();
+        let store = ProviderConfigStore::new(temporary.path().to_owned());
+        let identity = store.create_profile(&id).unwrap();
+        store.write_config(&identity, config.as_bytes()).unwrap();
         let context = ProviderContext {
             config_root: temporary.path().to_owned(),
             network: Default::default(),
-            config_overrides: BTreeMap::from([(id, config.into_bytes())]),
         };
-        AliyunProviderFactory.create(context).await.unwrap()
+        AliyunProviderFactory
+            .create(context, identity)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1322,17 +1386,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_provider_config_fields() {
+        assert!(
+            parse_config(
+                br#"
+                    client_id = "client-1"
+                    deprecated_endpoint = "https://example.invalid"
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_draft_account_remains_editable_without_client_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = ProviderContext {
+            config_root: temporary.path().to_owned(),
+            network: Default::default(),
+        };
+        let store = ProviderConfigStore::new(temporary.path().to_owned());
+        let identity = store.create_profile(&aliyun_id()).unwrap();
+        let factory = AliyunProviderFactory;
+        factory
+            .save_settings(
+                &context,
+                &identity,
+                &BTreeMap::from([("name".to_owned(), "Draft Aliyun".to_owned())]),
+            )
+            .unwrap();
+
+        let settings = factory.load_settings(&context, &identity).unwrap();
+        assert_eq!(settings.values.get("name").unwrap(), "Draft Aliyun");
+        assert_eq!(
+            factory.readiness(&context, &identity),
+            ProviderReadiness::Disabled
+        );
+    }
+
+    #[test]
     fn provider_settings_mask_secrets_and_replace_stale_token_state() {
         let temporary = tempfile::tempdir().unwrap();
         let context = ProviderContext {
             config_root: temporary.path().to_owned(),
             network: Default::default(),
-            config_overrides: BTreeMap::new(),
         };
         let store = ProviderConfigStore::new(temporary.path().to_owned());
+        let identity = store.create_profile(&aliyun_id()).unwrap();
         store
             .write_private_file(
-                &aliyun_id(),
+                &identity,
                 TOKEN_STATE_FILE,
                 br#"{"access_token":"old","refresh_token":"old-refresh","expires_at_unix":1}"#,
             )
@@ -1341,6 +1444,7 @@ mod tests {
         factory
             .save_settings(
                 &context,
+                &identity,
                 &BTreeMap::from([
                     ("client_id".to_owned(), "client-1".to_owned()),
                     ("refresh_token".to_owned(), "new-refresh".to_owned()),
@@ -1349,14 +1453,14 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .read_private_file(&aliyun_id(), TOKEN_STATE_FILE)
+                .read_private_file(&identity, TOKEN_STATE_FILE)
                 .unwrap()
                 .is_none()
         );
-        let snapshot = factory.load_settings(&context).unwrap();
+        let snapshot = factory.load_settings(&context, &identity).unwrap();
         assert!(snapshot.configured_secrets.contains("refresh_token"));
         assert_eq!(snapshot.values.get("refresh_token").unwrap(), "");
-        let saved = fs::read_to_string(store.config_path(&aliyun_id())).unwrap();
+        let saved = fs::read_to_string(store.config_path(&identity)).unwrap();
         assert!(saved.contains("new-refresh"));
         assert!(!format!("{snapshot:?}").contains("new-refresh"));
     }
@@ -1371,7 +1475,9 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let provider = provider_for(&base, &temporary, "").await;
         assert_eq!(provider.identity().provider_id, aliyun_id());
-        let path = temporary.path().join("providers/aliyun/token.json");
+        let path = ProviderConfigStore::new(temporary.path().to_owned())
+            .profile_dir(provider.identity())
+            .join(TOKEN_STATE_FILE);
         let state: StoredToken = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(state.refresh_token, "refresh-2");
         assert_eq!(state.access_token, "access-1");
@@ -1397,8 +1503,12 @@ mod tests {
         let provider = provider_for(&base, &temporary, "").await;
         let user = provider.user_info().await.unwrap();
         assert_eq!(user.id, "user-1");
-        let state =
-            fs::read_to_string(temporary.path().join("providers/aliyun/token.json")).unwrap();
+        let state = fs::read_to_string(
+            ProviderConfigStore::new(temporary.path().to_owned())
+                .profile_dir(provider.identity())
+                .join(TOKEN_STATE_FILE),
+        )
+        .unwrap();
         assert!(state.contains("refresh-2"));
         assert!(!user.display_name.contains("access-1"));
         let requests = server.await.unwrap();

@@ -1,10 +1,12 @@
-# pan-tui Provider TUI 设计文稿
+# net-pan Provider TUI 设计文稿
 
 - 文档版本：v4.0
-- 状态：Provider TUI、Google Installed App OAuth、SQLite runtime、daemon/IPC 与通知核心已实现；真实验收和 Settings 收尾仍在进行
-- 当前实现基线：Phase 20，Google/Aliyun Provider TUI；长期运行能力按 Phase 21–26 交付
-- 日期：2026-08-05
+- 状态：Provider TUI、Google Installed App OAuth、SQLite runtime、daemon/IPC、通知核心与工程化发布门禁已实现；真实 Provider 验收仍在进行
+- 当前实现基线：Phase 36，Google/Aliyun Provider、daemon/IPC、Account Navigation、作用域 Settings 与可验证发布流水线
+- 日期：2026-08-06
 - 语言规则：设计与计划文稿使用中文；README、Rust 代码及程序界面使用英文
+
+前半部分保留早期 Provider/Tab 设计的演进记录；当前 TUI 行为以第 22、23 节和 TODO Phase 34–36 为准。
 
 ## 1. 设计审阅结论
 
@@ -40,7 +42,7 @@
 2. TUI 不作为常驻进程；多个 Job 由独立 DownloadManager 或可选 daemon 持有。
 3. 第一版不加载动态库或第三方运行时插件；Provider 在编译时注册。
 4. 第一版不要求为不同 Provider 伪造完全相同的高级能力；不支持的能力必须显式显示原因。
-5. 第一版不自动改写或删除旧配置文件。
+5. 开发版不扫描或转换非当前配置布局。
 6. Google Docs/Sheets/Slides 等需要导出的对象仍可由 Google Provider 标记为不支持下载。
 
 ## 3. 统一概念
@@ -96,32 +98,36 @@ Files Tab 固定为两个可聚焦 Panel：
 
 ```text
 Pan TUI       [ Files ]  Logs  Settings       Google / project: Ready
+Source: cp_result | Status: Ready | Destination: /home/user/Downloads
 
-┌ Remote Files - cp_result/models ────────────────────────┐
+┌ cp_result / models ─────────────────────────────────────┐
 │ > [DIR ] checkpoints/                                   │
-│   [FILE] model.bin                           1.2 GiB     │
+│   [FILE] model.bin                           1.2 GB      │
 └─────────────────────────────────────────────────────────┘
                               Tab
 ┌ Transfers - 3 running / 12 queued / 8 done / 1 failed ─┐
-│ RUN    42% model-01.bin   420 MiB/1 GiB     18 MiB/s   │
-│ RUN     8% data.tar        80 MiB/1 GiB     12 MiB/s   │
-│ RUN    71% weights.bin    710 MiB/1 GiB      9 MiB/s   │
+│ RUN    42% model-01.bin   420 MB/1 GB       18 MB/s    │
+│ RUN     8% data.tar        80 MB/1 GB       12 MB/s    │
+│ RUN    71% weights.bin    710 MB/1 GB        9 MB/s    │
 │ WAIT       tokenizer.json                               │
 │ FAIL       config.bin       connection reset            │
-└──────────────────────────────────────── Total 39 MiB/s ┘
+└──────────────────────────────────────── Total 39 MB/s  ┘
 ```
 
-#### Remote Files Panel
+#### Files Panel
 
 - `↑/k`、`↓/j`、`PageUp/PageDown`、`Home/End`：移动选择。
 - `Enter/→`：高亮项为文件夹时进入。
-- `Backspace/←`：返回父目录；Source 根目录不能继续返回。
+- `Backspace`：返回父目录；Source 根目录不能继续返回。
 - `r`：重新读取当前 Source 或目录，并尽量保持原选择。
 - `d`：高亮项可下载时打开 Download Form。
 - `p`：打开 Provider/Source 选择器。
 
 Provider/Source 选择器使用 `←/→` 选择 Provider/Profile，`↑/↓` 选择 Source，`Enter` 激活，
 `Esc` 取消。切换 Provider/Source 后恢复对应 Session 的目录栈，而不是重建全局页面栈。
+
+真实目录的快捷键提示栏必须将 `Backspace parent` 放在首项，确保窄终端截断其他操作时仍能看到
+返回父目录的方法；Sources 入口层不显示无效的 parent 操作。
 
 #### Transfers Panel
 
@@ -137,11 +143,13 @@ Provider/Source 选择器使用 `←/→` 选择 Provider/Profile，`↑/↓` �
 
 | Panel | 内容 |
 |---|---|
-| 上方 | 可滚动日志列表，支持 All / Info / Error 筛选 |
+| 上方 | 可滚动日志列表，支持 Level 与 Target 两个正交筛选 |
 | 下方 | 所选日志的完整时间、Provider、Job、Transfer、路径和错误详情 |
 
 并行 Transfer 的日志允许交错，但每条记录必须携带可关联的 `provider_id`、`job_id` 和
-`transfer_id`。日志滚动到最新位置时继续跟随；用户向上滚动后保持所选记录。
+`transfer_id`。Provider/Source 日志属于全局 Session 日志，不建立独立文件；通过 `target=runtime /
+provider / source / daemon / settings / download` 分类。Level 支持 All / Info / Error，`f` 循环
+Target；两类筛选互不覆盖且不影响落盘。日志滚动到最新位置时继续跟随；用户向上滚动后保持所选记录。
 
 ### 4.5 Settings Tab
 
@@ -159,13 +167,12 @@ Provider/Source 选择器使用 `←/→` 选择 Provider/Profile，`↑/↓` �
 
 ### 4.6 Download Form 与退出
 
-Download Form 至少包含 Destination root、File workers 和只读 Target preview：
+Download Form 只包含只读 Global download root、File workers 和只读 Target preview：
 
-- `↑/↓` 切换字段；`←/→` 或 `-/+` 调整 workers。
-- 文本字段进入编辑模式后接受光标移动和普通字符。
-- `Enter` 在字段编辑时确认字段，在 Form 导航模式提交 Job。
-- `Esc` 先取消字段编辑，再关闭 Form。
-- `Tab` 不用于字段切换；若 Modal 未来具有两个 Panel，只能用于 Panel 焦点切换。
+- 全局下载根目录只在 Settings 上方 Panel 编辑和持久化，Download Form 不提供单 Job 覆盖。
+- `←/→`、`-/+` 或 `1..=5` 调整 workers，`Enter` 提交 Job，`Esc` 关闭 Form。
+- 提交前再次校验根目录是已存在的绝对真实目录且不是符号链接。
+- Target preview 由全局根目录、Source 内目录层级和高亮项安全名称组成；文件夹保持完整树结构。
 - workers 默认来自全局配置，第一版限制为 `1..=5`。
 
 退出确认框在所有 Tab、Panel、Form 和下载状态下共用。daemon 模式退出 TUI 只断开订阅；embedded
@@ -309,18 +316,27 @@ HTTP 状态码、Content-Range 和 Provider 私有下载 URL 在 Provider 内转
 ### 7.1 文件布局
 
 ```text
-~/.config/pan-tui/
-├── config.toml
-└── providers/
-    ├── google.toml
-    ├── aliyun.toml
-    ├── google/
-    │   └── service-account.json
-    └── aliyun/
-        └── token.json
+~/.net-pan/
+├── settings.toml
+├── providers/
+│   ├── google/
+│   │   └── p_k7m2x9qd/
+│   │       ├── config.toml
+│   │       ├── credentials.json
+│   │       ├── sources.json
+│   │       └── token.json
+│   └── aliyun/
+│       └── p_a4h8n2rw/
+│           ├── config.toml
+│           └── token.json
+├── state/
+│   ├── state.db
+│   ├── client-id
+│   └── net-pan.sock
+└── logs/
 ```
 
-`config.toml` 只包含公共行为：
+`settings.toml` 只包含公共行为：
 
 ```toml
 [download]
@@ -377,21 +393,11 @@ root_file_id = "root"
 
 Provider 配置文件和敏感状态使用 `0600`；目录使用 `0700`。序列化、错误和日志均经过脱敏。
 
-### 7.3 旧配置迁移
+### 7.3 开发版配置边界
 
-当前路径：
-
-```text
-~/.config/pan-tui/service-account.json
-~/.config/pan-tui/sources.json
-```
-
-迁移规则：
-
-1. 新 Google 配置不存在但旧文件存在时，以 legacy Google Profile 只读加载并显示迁移提示。
-2. 不自动移动、覆盖或删除旧文件。
-3. Settings 可执行显式迁移，写入新配置前先校验，失败时保持旧配置可用。
-4. `--credentials`、`--sources` 和相关环境变量在过渡期映射为 Google Profile 的运行时覆盖，并标记弃用。
+开发版只加载当前配置布局：全局配置位于 `settings.toml`，Provider 配置位于
+`providers/<provider>/<profile>/config.toml`，凭据和 token 位于同一 Profile 私有目录。未知字段直接
+报错；程序不扫描旧项目目录，不读取旧顶层 Google 文件，也不通过 CLI 或环境变量临时拼装 Provider 配置。
 
 ## 8. 应用与 Session 状态
 
@@ -518,8 +524,7 @@ UI 通过 ID 更新 `IndexMap` 中对应行。禁止使用单一 `current_path/c
 
 ## 11. 日志、安全与故障语义
 
-- 日志保存到 `~/.local/state/pan-tui/logs/YYYY-MM-DD/pan-tui_HH-mm-ss_NNN.log` 并按大小轮转；
-  设置 `XDG_STATE_HOME` 时使用 `$XDG_STATE_HOME/pan-tui/logs`。
+- 日志保存到 `~/.net-pan/logs/YYYY-MM-DD/net-pan_HH-mm-ss_NNN.log` 并按大小轮转。
 - 日志结构增加 Provider/Profile/Source/Job/Transfer 关联字段。
 - 不打印私钥、access token、refresh token、完整认证响应或带敏感 query 的下载 URL。
 - Provider 错误分为 Config、Auth、Permission、RateLimit、Network、NotFound、Unsupported 和 Internal。
@@ -577,14 +582,14 @@ Job 提交/取消/快照/订阅全部通过 `PanClient`。Google 或阿里云盘
 
 1. Fake Provider 可通过 Registry 注册并完成 Source、目录和下载流测试，核心无 provider-id 分支。
 2. 重复 ProviderId、无配置、坏配置和单 Provider 连接失败均有测试。
-3. Google 旧配置只读兼容和显式迁移不覆盖原文件。
+3. 当前 Google 配置可加载，未知字段和非当前配置布局会被拒绝。
 4. `[`/`]` 只切 Tab，`Tab/Shift-Tab` 只切 Panel，文本编辑不误触全局键位。
 5. Provider/Source 切换后恢复目录栈、选择位置和加载状态。
 6. workers 为 3 时可同时出现 3 个 Running Transfer，且每行进度互不覆盖。
 7. 并发事件乱序、失败、Skipped、未知大小和完成状态不可回退。
 8. Provider 热重建不替换活动 Job 持有的实例。
 9. Ratatui `TestBackend` 在窄终端和常规终端中不出现标题、行内容或 footer 重叠。
-10. Google Provider 迁移前后的列表、递归计划、续传和路径行为一致。
+10. Google Provider 在当前配置下的列表、递归计划、续传和路径行为一致。
 
 ### 13.2 真实使用检查
 
@@ -611,21 +616,192 @@ runtime、SQLite 恢复、daemon/IPC、可靠通知，最后完成 embedded 与 
 
 ## 15. 长期运行、IPC 与通知
 
-1. `pan-tui` 默认仍可作为一次性 TUI/CLI；可选 `daemon` 负责跨终端生命周期的 Job、恢复和通知。
+1. `net-pan` 默认仍可作为一次性 TUI/CLI；可选 `daemon` 负责跨终端生命周期的 Job、恢复和通知。
    socket 存在时 TUI 优先连接 daemon；没有 socket 时才创建 embedded runtime。
-2. SQLite、WAL sidecar、稳定 IPC client-id 和日志统一位于 `~/.local/state/pan-tui/`，使用私有权限；
+2. SQLite、WAL sidecar、稳定 IPC client-id、socket 和日志统一位于 `~/.net-pan/`，使用私有权限；
    凭据、Notifier secret 与签名下载 URL 不进入数据库。
 3. Job 请求和快照可序列化，Progress 节流批量写入；启动时 Running/Queued 原子转为 Interrupted，
    Provider 可用时使用原 Job ID 与 `.part` 继续。
-4. Linux IPC 使用 `0600` Unix socket 和版本化 JSON；协议 v3 传公共 Provider catalog、Source、
+4. Linux IPC 使用 `0600` Unix socket 和版本化 JSON；协议 v5 传公共 Account catalog、Source、
    `RemoteRef` 浏览/元数据、脱敏设置快照、Job 请求、完整快照和错误分类。
    `client_id + request_id` 幂等映射与 Job 在同一 SQLite 事务写入；订阅建立时无条件发送当前完整快照，
    避免 daemon 重启后 revision 归零导致 TUI 无法恢复。
    二进制入口不直接构造 `IpcRequest`：CLI daemon 调用库级 `DaemonService`，TUI 与 CLI 控制命令共用
-   `DaemonClient` 的 provider/source/list/stat/settings、status、submit、cancel 和 subscribe 实现。
+   `DaemonClient` 的 provider/source/list/stat/settings、status、submit、pause/resume、cancel 和 subscribe 实现。
 5. Google Installed App 使用 Authorization Code + PKCE + loopback callback；ProviderFactory 统一提供
    `auth_status/login/revoke`，token 轮换通过 `0600` 原子 CredentialStore 持久化。
 6. Notifier 是独立于 Provider 的第二套编译期注册器。钉钉和飞书 webhook/secret 只存在于 `0600` 配置，通用事件不携带
    token、签名 URL 或文件内容。
 7. Job 终态和 notification outbox 在同一 SQLite 事务中提交；daemon worker 处理 Retry-After、指数
    退避和 DeadLetter，进程重启后继续待发送项。
+
+## 16. TUI 视觉系统
+
+Phase 28 的旧三 Tab 布局已由 Phase 34 替代。当前设计参考 `cc-switch` 的紧凑应用 Shell、
+表格化数据行、反色选中和上下文 Footer，并使用永久左侧 Navigation。
+
+1. 顶部 Shell 固定显示产品名、Provider Type、embedded/daemon 模式、Account/Source、短状态和全局 Destination。
+2. Provider 错误详情不塞入 Shell；Shell 只显示 `NeedsConfig`、`ConfigError`、`ConnectionError` 等短分类，
+   完整详情保留在 Settings、状态消息和日志中。
+3. Files、Transfers、Logs 和 Settings 使用稳定列布局；窄终端优先裁剪名称、路径和消息，不挤掉状态列。
+4. 当前 Tab、当前 Panel 和当前行必须在无颜色终端中仍可辨认：Tab/行使用反色，Panel 标题使用焦点标记。
+5. Transfers 是独立 Navigation 页面；无活动 Job 时显示 Idle 行，并行时逐行显示状态、路径、进度和速度。
+6. Footer 使用无边框的单行快捷键提示条，按键以反色块显示并跟随 Tab、Panel、Modal 和浏览层级变化；
+   运行消息和计数显示在当前 Tab 的上方 Panel 状态行。
+7. Account 选择位于 Navigation；Source 选择器只选择当前 Account 的 Source。
+8. Ratatui `TestBackend` 至少覆盖 `60x20`、`80x24` 和常规终端；真实 PTY 验收覆盖 Files、Logs、
+   Settings、Provider Modal 和上下 Panel 焦点。
+
+Decision：选择借鉴 `cc-switch` 的视觉系统和左侧导航，但保留网盘文件表格的紧凑密度。
+Basis：本地代码与同尺寸 PTY 对照。
+Reason：保留网盘浏览和并行传输的有效空间，同时提高状态扫描和焦点辨识效率。
+
+## 17. Provider 设置说明与 Saved Links 首屏
+
+Phase 29 消除 Shell、Provider 设置和保存链接层中的术语歧义，不改变 Provider、Job 或 IPC 的职责边界。
+
+1. 公共 `ProviderSetting` 带有 Provider Factory 自有的字段说明。Google 与 Aliyun 必须解释每个字段的
+   用途、合法值或文件类型、敏感信息处理和继承关系；TUI 只通用渲染当前选中字段的 HELP。
+2. Provider Settings 底部固定区分 HELP 与 STATUS。HELP 来自 schema，STATUS 只报告 Ready、只读原因、
+   保存结果或重建错误，禁止再用一条泛化状态替代字段说明。
+3. Provider proxy 非空时覆盖全局应用 proxy；为空时继承全局 proxy；两者都为空时直连。
+   reqwest 客户端始终忽略 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等系统代理环境变量。
+4. Shell 使用 `Provider:`、`Account:`、`Source:`、`Status:` 显式标签。Breadcrumb 只属于 Files
+   Panel，不再与 Provider 身份拼接成斜线文本。
+5. Provider Source 列表是 Files 的首屏虚拟层，标题为 Sources、类型为 `[LINK]`。启动时
+   `Source: -`，不自动读取第一个 Source；用户按 Enter 后才激活链接、读取根目录并显示 Source 名。
+6. 进入 Source 后 Files 标题只显示 `<source>[/...]`，不重复 Remote Files 或虚拟入口名；路径超宽时
+   保留首尾组件并将中间折叠为 `...`。返回入口层后恢复 Sources 语义。
+7. 容量和速率采用现有 1024 进位，但面向用户统一显示 B/KB/MB/GB/TB，避免界面混用 IEC 标签。
+
+Decision：保存链接是显式可进入的导航层，不是启动参数的隐式自动打开结果。
+Basis：真实 Google Source 的 PTY 使用反馈与 Phase 28 `80x24` 渲染。
+Reason：用户先确认可用链接，再进入远端目录；Provider 身份、Source 选择和目录位置各自只有一个明确位置。
+
+## 18. 全局下载根目录与 Panel 状态
+
+Phase 31 将下载位置收敛为一个全局持久根目录，并消除 Footer 与 Panel 的重复状态。
+
+1. Settings 上方 Panel 使用 `Up/Down` 选择 Download path 或 Proxy URL，`Enter` 编辑并保存到
+   `settings.toml`；只有 Proxy 实际变化时才重连 Provider。
+2. Download path 必须是已存在的绝对目录，且路径本身不能是符号链接。无效默认值不阻止 TUI
+   启动，但不能保存或提交下载。
+3. 所有 Job 使用同一全局根目录。远端文件夹及其后代完整写入
+   `<global-root>/<source-relative-tree>`；Download Form 只显示根目录和最终目标，不提供临时覆盖。
+4. Files、Logs、Global Settings 的运行输出固定显示在各自上方 Panel 最后一行。Provider Settings
+   继续在下方 Panel 区分 HELP 与 STATUS。
+5. Phase 31 当时将 Transfers 的选择摘要与 DESTINATION 分行显示；Phase 32 已将 Destination 收敛到
+   顶部 Shell，并删除空闲 Transfers 中的选择摘要。
+
+Decision：下载根目录只有一个持久配置入口。
+Basis：当前 TUI 使用反馈与目录树下载语义。
+Reason：避免 Global Settings 与单 Job Form 产生两个互相覆盖的目录来源，同时让最终落盘位置可预测。
+
+## 19. Files 信息层级与路径折叠
+
+Phase 32 删除 Files 页面中不提供新信息的重复标签，让位置、目标和操作各自只有一个稳定入口。
+
+1. 全局下载目录只在顶部 Shell 显示为 `Destination:`；Transfers 空闲态不再显示 `SELECTED`、类型、
+   unknown size 或第二份 destination。
+2. Files Panel 标题就是当前实际目录 Breadcrumb。虚拟入口显示 `Sources`；进入 Source 后不显示
+   `Remote Files`、`Shared links` 等可由上下文推断的前缀。
+3. Breadcrumb 超过可用宽度时保留 Source 根和最靠近当前位置的尾部目录，中间使用 `...` 折叠，避免
+   只保留开头而丢失当前目录。
+4. 底部使用无边框的单行快捷键提示条呈现当前上下文键位，按键显示为反色块；状态输出仍位于上方
+   Panel，不进入提示条。
+5. `60x20` 和 `80x24` 下 Destination、状态分类、路径尾部、Panel 焦点和快捷键提示条不得互相覆盖。
+
+Decision：位置标题、下载目标和操作帮助分别归属 Files Panel、顶部 Shell 和底部快捷键提示条。
+Basis：真实深层 Google Source 浏览反馈。
+Reason：消除重复说明，同时保留深层路径定位和可发现的操作入口。
+
+## 20. 上下文快捷键提示条
+
+Phase 33 将 Phase 32 的带框 Actions 区域收敛为与 `cc-switch` 相同语义的底部快捷键提示条。
+
+1. 提示条不显示标题、边框或状态文本；宽度足够时占一行，操作放不下时按完整提示组自动扩展为两行。
+2. 每组提示由反色按键块和紧随其后的动作组成；当前 Panel 的主要操作使用强调色，全局操作使用次级色。
+3. Files、Transfers、Logs、Log Detail、Global Settings 和 Provider Settings 分别提供自己的提示集合，
+   切换 Tab 或 Panel 后立即更新。Provider 选择器等前景 Modal 在自身边界内调用同一提示条组件，外层
+   Footer 继续显示背景 Tab/Panel 的提示，不用前景操作覆盖背景语义。
+4. 提示顺序优先放置当前上下文的核心操作；真实目录始终先显示返回父目录。换行不能拆开按键与动作，
+   两行内必须优先保留全部可执行操作。
+
+Decision：Footer 是操作提示条，不是第三个 Panel。
+Basis：本地 `cc-switch` 的 `80x24` 实际界面与当前 TUI 使用反馈。
+Reason：减少不必要边框和垂直占用，同时让焦点变化直接反映为可执行操作。
+
+## 21. 开发版版本策略
+
+Phase 30 明确项目尚未发布稳定版，因此不承担旧配置、旧数据库或旧 IPC payload 的兼容成本。
+
+1. 当前配置布局是唯一输入：`settings.toml` 与 `providers/<provider>/<profile>/config.toml`。配置结构使用
+   严格字段检查，未知字段报错，Provider 缺少配置时进入 NeedsConfig。
+2. Google 不扫描 `~/.config/net-pan/`、`~/.config/pan-tui/` 或旧项目目录，不执行运行时复制、迁移或只读回退。
+3. Provider 配置不接受 CLI/env 内容覆盖。CLI 只选择 Provider、目标目录和本次下载行为，Provider
+   凭据、Source 和 endpoint 必须由 Provider 配置管理。
+4. SQLite 空库直接创建当前 schema v3；非 v3 数据库拒绝打开。开发期间 schema 变化允许用户清理
+   state 数据后重建，不在运行时保留逐版本 migration。
+5. IPC 保留版本号用于确定拒绝不匹配的 client/daemon，但当前 DTO 的字段均按当前协议必需；不为旧
+   payload 补默认字段。
+6. `serde(default)` 仅用于当前配置中的可选值或上游 API 的可缺省响应，不得用于隐藏本项目协议和
+   持久化结构的版本差异。
+
+Decision：稳定版发布前采用 current-only 策略。
+Basis：项目仍处于开发阶段，配置和协议尚在快速收敛。
+Reason：减少双路径和迁移测试负担，让错误尽早暴露，避免旧行为限制 Provider、daemon 和 TUI 设计。
+
+## 22. net-pan Account Profile 与 Navigation
+
+Phase 34 将应用身份从“一个 Provider Type 对应一个 default 实例”升级为
+`Provider Type -> Active Account Profile -> Source`。
+
+1. 产品和二进制统一命名为 `net-pan`，唯一应用根目录为 `~/.net-pan`。全局设置固定写入
+   `settings.toml`，不再使用 XDG 下的旧 `net-pan` 配置或状态路径。
+2. Profile 是某个 Provider Type 下独立的一套账号、凭据、Token、Proxy、Sources 和远端信息。
+   TUI 面向用户统一显示 `Account`，代码保留 `ProfileId`。
+3. ProfileId 由程序生成，格式为 `p_` 加 8 位无歧义小写字母或数字。它只作为稳定目录和数据库身份，
+   不从显示名称派生，也不随重命名变化。
+4. Profile 目录固定为 `providers/<provider>/<profile>/`，其中 `config.toml` 保存可编辑配置；凭据、
+   OAuth Token、轮换状态和 Provider 私有文件均留在同一目录。
+5. ProviderManager 以 `ProviderIdentity { provider_id, profile_id }` 为键。Provider catalog 可返回同一
+   ProviderId 的多个 Profile；设置保存、认证、Sources、用户/Drive 信息和热重建都接收完整 Identity。
+6. Header 使用 `[`/`]` 切换 Provider Type。左侧 Navigation 管理 Accounts、Files、Transfers、Logs 和
+   Provider Settings；上下键只移动 Navigation 光标，Enter 提交 route，Left/Right 在 Navigation 与
+   Content 间移动。`Tab` 只属于右侧多 Pane 页面；`g` 打开独立 Global Settings 层。
+7. 每个 Provider Type 记住最后激活的 Profile。激活 Profile 后，Files、Provider Settings、用量和新 Job
+   使用该 Identity；运行中的 Job 和历史记录继续绑定提交时的 Identity。
+8. Source 不是 Profile。Source 是当前 Account 提供的一个浏览入口；目录栈仍按
+   `ProviderIdentity + SourceId` 独立保存。
+
+Decision：Provider Type、Account Profile 和 Source 使用三个独立层级。
+Basis：`cc-switch` 的应用类型与自定义配置选择模型，以及网盘账号、共享盘和目录入口的实际区别。
+Reason：用户可以给账号任意命名，同时内部路径、Token、Job 和用量使用不受重命名影响的稳定身份。
+
+## 23. TUI Shell、设置作用域与 Provider 主题
+
+Phase 35 直接采用 `cc-switch-cli` 的 TUI 布局原则：顶部类型 chips、左侧 Navigation、右侧单页内容、
+集中式 Theme、焦点边框和上下文 Footer。网盘领域状态、组件代码和数据流仍由 `net-pan` 独立实现；
+MIT 来源与许可保存在 `THIRD_PARTY_NOTICES`。
+
+1. 当前 Provider Type 决定业务页面的 accent。Google 为蓝色，Aliyun 为橙色；成功、警告和错误仍使用
+   独立语义色，不让整个界面退化成单色主题。
+2. 左侧 `Settings` 只表示当前 Provider/Account 配置，显示 ProviderIdentity、Account 名称、状态和
+   `providers/<provider>/<profile>/config.toml`，不读取应用全局字段。
+3. Accounts 页面按 Enter 在原内容区进入 `Accounts / <account>`，复用 Provider 设置组件；通过
+   Backspace 返回 Accounts 列表，不创建 Tab、Modal 或中间页面。
+4. `g` 进入独立 `GLOBAL SETTINGS` 层并显示 `~/.net-pan/settings.toml`，仅 Backspace 返回；`[`/`]` 只切换 Provider
+   Type。Navigation 使用 Up/Down + Enter，Left/Right 移动区域焦点；`Tab` 仅切右侧页面内部 Pane。
+5. Header、Navigation、内容页和 Footer 共享 Theme；全局 Settings 使用黑色选中块和中性灰色焦点边框，避免
+   用户把应用配置误认为当前 Account 配置。
+6. 页面按键由 `keymap.rs` 的 Binding 表统一声明，事件分发与 Footer 从同一数据生成。显示按键只保留
+   主要入口，旧键或 Vim `h/j/k/l` 作为隐藏别名；文本编辑、Modal 和全局按键按层级优先分发。
+7. Files 中目录和普通文件均使用终端默认前景色，仅由 `[DIR]`、`[FILE]` 和目录尾部 `/` 区分。Global
+   Settings 的可编辑表仅包含 Download path 与 Proxy URL，派生连接信息位于独立 READ ONLY 区域；Provider
+   Settings 同样拆分可编辑字段与 Action/派生只读字段，选择光标只遍历可编辑索引。
+8. Provider 与 Global Settings 均使用 Enter 进入编辑、Ctrl-S 保存、Esc 停止编辑；Enter 不承担保存。
+   保存成功后停留在 Settings 页面、结束编辑，并在屏幕中央显示两秒 Toast；失败时保留编辑状态。
+
+Decision：直接采用 cc-switch-cli 的 Shell 与交互层级，但保持 net-pan 的组件实现和领域状态独立。
+Basis：cc-switch-cli 的 MIT 许可、Rust/ratatui 技术栈，以及其已验证的紧凑终端信息架构。
+Reason：减少重新发明通用 TUI 导航的成本，同时让 Account、Source、Transfer 和 daemon 约束保持清晰。

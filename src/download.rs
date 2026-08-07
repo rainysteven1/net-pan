@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,6 +18,9 @@ use crate::{
     plan::{DownloadPlan, PlannedFile},
     provider::{CloudProvider, ProviderIdentity, RemoteDownload, RemoteItem},
 };
+
+const STREAM_RETRY_LIMIT: usize = 4;
+const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct DownloadOptions {
@@ -39,6 +42,7 @@ pub enum DownloadJobState {
     Queued,
     Scanning,
     Running,
+    Paused,
     Finished,
     Failed,
     Cancelled,
@@ -58,6 +62,7 @@ impl DownloadJobState {
 pub enum TransferState {
     Queued,
     Running,
+    Paused,
     Completed,
     Skipped,
     Failed,
@@ -114,6 +119,24 @@ pub enum DownloadEvent {
         file_written: u64,
         file_total: Option<u64>,
         bytes_per_second: f64,
+    },
+    Retrying {
+        job_id: JobId,
+        provider: ProviderIdentity,
+        transfer_id: TransferId,
+        path: PathBuf,
+        offset: u64,
+        attempt: usize,
+        max_attempts: usize,
+        error: String,
+    },
+    Paused {
+        job_id: JobId,
+        provider: ProviderIdentity,
+    },
+    Resumed {
+        job_id: JobId,
+        provider: ProviderIdentity,
     },
     FileSkipped {
         job_id: JobId,
@@ -467,31 +490,131 @@ async fn download_one_inner(
         .await
         .with_context(|| format!("failed to open {} for writing", partial.display()))?;
     let mut written = offset;
-    let mut received = 0_u64;
-    let transfer_started = Instant::now();
-    while let Some(chunk) = remote_stream.next().await {
-        let chunk = chunk.context("failed to read provider download stream")?;
+    let mut progress_window_written = written;
+    let mut progress_window_started = Instant::now();
+    let mut retry_count = 0;
+    loop {
+        let wait = PROGRESS_EVENT_INTERVAL.saturating_sub(progress_window_started.elapsed());
+        let chunk = match tokio::time::timeout(wait, remote_stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                send_progress(
+                    client,
+                    file,
+                    context,
+                    written,
+                    expected_size,
+                    progress_window_written,
+                    progress_window_started,
+                )
+                .await;
+                progress_window_written = written;
+                progress_window_started = Instant::now();
+                continue;
+            }
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error)
+                if options.resume
+                    && file.item.supports_resume()
+                    && retry_count < STREAM_RETRY_LIMIT =>
+            {
+                retry_count += 1;
+                let reason = error.to_string();
+                output.flush().await.with_context(|| {
+                    format!("failed to flush partial file: {}", partial.display())
+                })?;
+                let _ = context
+                    .events
+                    .send(DownloadEvent::Retrying {
+                        job_id: context.job_id,
+                        provider: client.identity().clone(),
+                        transfer_id: context.transfer_id,
+                        path: file.relative_path.clone(),
+                        offset: written,
+                        attempt: retry_count,
+                        max_attempts: STREAM_RETRY_LIMIT,
+                        error: reason.clone(),
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(250 * retry_count as u64))
+                    .await;
+                let reopened = client.open_download(&file.item, written).await.map_err(|open| {
+                        anyhow!(
+                            "download stream retry {retry_count}/{STREAM_RETRY_LIMIT} failed at byte offset {written}: original stream error: {reason}; reopen error: {open}"
+                        )
+                    })?;
+                remote_stream = match reopened {
+                    RemoteDownload::Partial { start, stream, .. } if start == written => stream,
+                    RemoteDownload::AlreadyComplete { expected_size }
+                        if expected_size == written && file.item.size == Some(expected_size) =>
+                    {
+                        break;
+                    }
+                    RemoteDownload::Partial { start, .. } => {
+                        bail!(
+                            "download stream retry {retry_count}/{STREAM_RETRY_LIMIT} returned byte offset {start}, expected {written}; original stream error: {reason}"
+                        );
+                    }
+                    RemoteDownload::Full { .. } => {
+                        bail!(
+                            "download stream retry {retry_count}/{STREAM_RETRY_LIMIT} ignored Range at byte offset {written}; original stream error: {reason}"
+                        );
+                    }
+                    RemoteDownload::AlreadyComplete { expected_size } => {
+                        bail!(
+                            "download stream retry {retry_count}/{STREAM_RETRY_LIMIT} reported size {expected_size} at byte offset {written}; original stream error: {reason}"
+                        );
+                    }
+                };
+                progress_window_written = written;
+                progress_window_started = Instant::now();
+                continue;
+            }
+            Err(error) => {
+                bail!(
+                    "provider download stream failed after {retry_count}/{STREAM_RETRY_LIMIT} retries at byte offset {written} (expected {}): {error}",
+                    expected_size
+                        .map(|size| size.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                );
+            }
+        };
         output
             .write_all(&chunk)
             .await
             .with_context(|| format!("failed to write local file: {}", partial.display()))?;
         written = written.saturating_add(chunk.len() as u64);
-        received = received.saturating_add(chunk.len() as u64);
-        let elapsed = transfer_started.elapsed().as_secs_f64().max(0.001);
-        let _ = context
-            .events
-            .send(DownloadEvent::Progress {
-                job_id: context.job_id,
-                provider: client.identity().clone(),
-                transfer_id: context.transfer_id,
-                index: context.index,
-                total: context.total,
-                path: file.relative_path.clone(),
-                file_written: written,
-                file_total: expected_size,
-                bytes_per_second: received as f64 / elapsed,
-            })
+        if progress_window_started.elapsed() >= PROGRESS_EVENT_INTERVAL
+            || expected_size == Some(written)
+        {
+            send_progress(
+                client,
+                file,
+                context,
+                written,
+                expected_size,
+                progress_window_written,
+                progress_window_started,
+            )
             .await;
+            progress_window_written = written;
+            progress_window_started = Instant::now();
+        }
+    }
+    if written != progress_window_written {
+        send_progress(
+            client,
+            file,
+            context,
+            written,
+            expected_size,
+            progress_window_written,
+            progress_window_started,
+        )
+        .await;
     }
     output.flush().await?;
     output.sync_all().await?;
@@ -509,6 +632,33 @@ async fn download_one_inner(
         .await
         .with_context(|| format!("failed to finalize {} atomically", target.display()))?;
     Ok(FileOutcome::Downloaded(written))
+}
+
+async fn send_progress(
+    client: &dyn CloudProvider,
+    file: &PlannedFile,
+    context: TransferContext<'_>,
+    written: u64,
+    expected_size: Option<u64>,
+    window_written: u64,
+    window_started: Instant,
+) {
+    let elapsed = window_started.elapsed().as_secs_f64().max(0.001);
+    let bytes_per_second = written.saturating_sub(window_written) as f64 / elapsed;
+    let _ = context
+        .events
+        .send(DownloadEvent::Progress {
+            job_id: context.job_id,
+            provider: client.identity().clone(),
+            transfer_id: context.transfer_id,
+            index: context.index,
+            total: context.total,
+            path: file.relative_path.clone(),
+            file_written: written,
+            file_total: expected_size,
+            bytes_per_second,
+        })
+        .await;
 }
 
 fn partial_path(target: &Path) -> PathBuf {
@@ -561,7 +711,7 @@ async fn actual_partial_bytes(partial: &Path) -> u64 {
 }
 
 pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -727,8 +877,8 @@ mod tests {
     #[test]
     fn formats_sizes() {
         assert_eq!(format_bytes(12), "12 B");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 
     #[tokio::test]
@@ -818,6 +968,222 @@ mod tests {
                 ..
             }
         )));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skips_an_existing_local_file_without_opening_the_provider_download() {
+        let client = HttpProvider::new("http://127.0.0.1:1/drive/v3/files".to_owned());
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("root/existing.bin");
+        fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+        fs::write(&target, b"keep-local-copy").await.unwrap();
+        let item = client.item("existing-file-123456789", "existing.bin", 1024);
+        let plan = DownloadPlan {
+            root_name: "root".to_owned(),
+            directories: vec![PathBuf::from("root")],
+            files: vec![PlannedFile {
+                item,
+                relative_path: PathBuf::from("root/existing.bin"),
+            }],
+            skipped: Vec::new(),
+            total_bytes: 1024,
+        };
+        let (sender, mut receiver) = mpsc::channel(128);
+        execute_plan(
+            &client,
+            JobId(4),
+            &client.identity,
+            plan,
+            directory.path(),
+            DownloadOptions {
+                overwrite: false,
+                resume: true,
+                concurrency: 1,
+            },
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&target).await.unwrap(), b"keep-local-copy");
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DownloadEvent::FileSkipped { reason, .. } if reason.starts_with("target exists")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DownloadEvent::Finished {
+                summary: DownloadSummary {
+                    downloaded: 0,
+                    skipped: 1,
+                    failed: 0,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn progress_speed_uses_the_same_window_and_drops_to_zero_when_stalled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcd")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(650)).await;
+            stream.write_all(b"efgh").await.unwrap();
+        });
+
+        let client = HttpProvider::new(format!("http://{address}/drive/v3/files"));
+        let directory = tempfile::tempdir().unwrap();
+        let item = client.item("stalled-file-123456789", "stalled.bin", 8);
+        let plan = DownloadPlan {
+            root_name: "root".to_owned(),
+            directories: vec![PathBuf::from("root")],
+            files: vec![PlannedFile {
+                item,
+                relative_path: PathBuf::from("root/stalled.bin"),
+            }],
+            skipped: Vec::new(),
+            total_bytes: 8,
+        };
+        let (sender, mut receiver) = mpsc::channel(128);
+        execute_plan(
+            &client,
+            JobId(3),
+            &client.identity,
+            plan,
+            directory.path(),
+            DownloadOptions {
+                overwrite: false,
+                resume: true,
+                concurrency: 1,
+            },
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let progress: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DownloadEvent::Progress {
+                    file_written,
+                    bytes_per_second,
+                    ..
+                } => Some((*file_written, *bytes_per_second)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            progress
+                .iter()
+                .any(|(written, speed)| *written == 4 && *speed > 0.0),
+            "expected a positive speed sample for the first four bytes: {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|(written, speed)| *written == 4 && *speed == 0.0),
+            "expected the stalled transfer speed to decay to zero: {progress:?}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("root/stalled.bin"))
+                .await
+                .unwrap(),
+            b"abcdefgh"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_a_broken_response_body_from_the_written_offset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = first.read(&mut request).await.unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let count = second.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("Range: bytes=5-") || request.contains("range: bytes=5-"));
+            second
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 5-10/11\r\nConnection: close\r\n\r\n world",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = HttpProvider::new(format!("http://{address}/drive/v3/files"));
+        let directory = tempfile::tempdir().unwrap();
+        let item = client.item("flaky-file-123456789", "flaky.bin", 11);
+        let plan = DownloadPlan {
+            root_name: "root".to_owned(),
+            directories: vec![PathBuf::from("root")],
+            files: vec![PlannedFile {
+                item,
+                relative_path: PathBuf::from("root/flaky.bin"),
+            }],
+            skipped: Vec::new(),
+            total_bytes: 11,
+        };
+        let (sender, mut receiver) = mpsc::channel(128);
+        execute_plan(
+            &client,
+            JobId(2),
+            &client.identity,
+            plan,
+            directory.path(),
+            DownloadOptions {
+                overwrite: false,
+                resume: true,
+                concurrency: 1,
+            },
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read(directory.path().join("root/flaky.bin"))
+                .await
+                .unwrap(),
+            b"hello world"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DownloadEvent::Retrying {
+                offset: 5,
+                attempt: 1,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DownloadEvent::FileCompleted { bytes: 11, .. }))
+        );
         server.await.unwrap();
     }
 

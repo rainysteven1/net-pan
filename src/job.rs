@@ -55,7 +55,6 @@ pub struct TransferSnapshot {
     pub state: TransferState,
     pub size: Option<u64>,
     pub written: u64,
-    #[serde(default)]
     pub bytes_per_second: f64,
     pub error: Option<String>,
 }
@@ -211,6 +210,40 @@ impl DownloadManager {
         self.start_job(job_id, provider, request).await
     }
 
+    pub async fn resume_paused(
+        &self,
+        job_id: JobId,
+        provider: Arc<dyn CloudProvider>,
+    ) -> Result<()> {
+        let request = {
+            let snapshots = self.inner.snapshots.lock().await;
+            let snapshot = snapshots
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("download Job {} was not found", job_id.0))?;
+            ensure!(
+                snapshot.state == DownloadJobState::Paused,
+                "download Job {} is not paused",
+                job_id.0
+            );
+            snapshot.request.clone()
+        };
+        ensure_provider_matches(provider.as_ref(), &request)?;
+        if let Some(state) = &self.inner.state {
+            state.mark_requeued(job_id)?;
+        }
+        let event = DownloadEvent::Resumed {
+            job_id,
+            provider: provider.identity().clone(),
+        };
+        if let Some(state) = &self.inner.state
+            && let Err(error) = state.record_event(&event)
+        {
+            *self.inner.persistence_error.lock().await = Some(format!("{error:#}"));
+        }
+        let _ = self.inner.events.send(event);
+        self.start_job(job_id, provider, request).await
+    }
+
     async fn start_job(
         &self,
         job_id: JobId,
@@ -304,7 +337,7 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub async fn cancel(&self, job_id: JobId) -> bool {
+    pub async fn pause(&self, job_id: JobId) -> bool {
         let Some(task) = self.inner.tasks.lock().await.remove(&job_id) else {
             return false;
         };
@@ -314,10 +347,49 @@ impl DownloadManager {
             let Some(snapshot) = snapshots.get_mut(&job_id) else {
                 return true;
             };
-            snapshot.state = DownloadJobState::Cancelled;
+            snapshot.state = DownloadJobState::Paused;
             for transfer in snapshot.transfers.values_mut() {
                 if !transfer.state.is_terminal() {
+                    transfer.state = TransferState::Paused;
+                    transfer.bytes_per_second = 0.0;
+                }
+            }
+            snapshot.request.target.reference.identity.clone()
+        };
+        let event = DownloadEvent::Paused { job_id, provider };
+        if let Some(state) = &self.inner.state
+            && let Err(error) = state.record_event(&event)
+        {
+            *self.inner.persistence_error.lock().await = Some(format!("{error:#}"));
+        }
+        let _ = self.inner.events.send(event);
+        true
+    }
+
+    pub async fn cancel(&self, job_id: JobId) -> bool {
+        let task = self.inner.tasks.lock().await.remove(&job_id);
+        if let Some(task) = task {
+            task.abort();
+        } else {
+            let snapshots = self.inner.snapshots.lock().await;
+            if !snapshots
+                .get(&job_id)
+                .is_some_and(|snapshot| snapshot.state == DownloadJobState::Paused)
+            {
+                return false;
+            }
+        }
+        let provider = {
+            let mut snapshots = self.inner.snapshots.lock().await;
+            let Some(snapshot) = snapshots.get_mut(&job_id) else {
+                return true;
+            };
+            snapshot.state = DownloadJobState::Cancelled;
+            for transfer in snapshot.transfers.values_mut() {
+                if !transfer.state.is_terminal() || transfer.state == TransferState::Paused {
                     transfer.state = TransferState::Interrupted;
+                    transfer.bytes_per_second = 0.0;
+                    transfer.error = Some("stopped by user".to_owned());
                 }
             }
             snapshot.request.target.reference.identity.clone()
@@ -470,6 +542,28 @@ async fn apply_snapshot(
                 error: None,
             },
         ),
+        DownloadEvent::Retrying {
+            transfer_id,
+            path,
+            offset,
+            attempt,
+            max_attempts,
+            error,
+            ..
+        } => update_transfer(
+            snapshot,
+            SnapshotTransferUpdate {
+                id: *transfer_id,
+                path,
+                state: TransferState::Running,
+                size: None,
+                written: *offset,
+                bytes_per_second: 0.0,
+                error: Some(format!(
+                    "stream retry {attempt}/{max_attempts} at byte {offset}: {error}"
+                )),
+            },
+        ),
         DownloadEvent::FileSkipped {
             transfer_id,
             path,
@@ -530,6 +624,16 @@ async fn apply_snapshot(
             snapshot.state = DownloadJobState::Failed;
             snapshot.error = Some(error.clone());
         }
+        DownloadEvent::Paused { .. } => {
+            snapshot.state = DownloadJobState::Paused;
+            for transfer in snapshot.transfers.values_mut() {
+                if !transfer.state.is_terminal() {
+                    transfer.state = TransferState::Paused;
+                    transfer.bytes_per_second = 0.0;
+                }
+            }
+        }
+        DownloadEvent::Resumed { .. } => snapshot.state = DownloadJobState::Queued,
         DownloadEvent::Cancelled { .. } => snapshot.state = DownloadJobState::Cancelled,
     }
 }
@@ -575,11 +679,14 @@ fn event_job_id(event: &DownloadEvent) -> JobId {
         | DownloadEvent::TransferQueued { job_id, .. }
         | DownloadEvent::FileStarted { job_id, .. }
         | DownloadEvent::Progress { job_id, .. }
+        | DownloadEvent::Retrying { job_id, .. }
         | DownloadEvent::FileSkipped { job_id, .. }
         | DownloadEvent::FileCompleted { job_id, .. }
         | DownloadEvent::FileFailed { job_id, .. }
         | DownloadEvent::Finished { job_id, .. }
         | DownloadEvent::Fatal { job_id, .. }
+        | DownloadEvent::Paused { job_id, .. }
+        | DownloadEvent::Resumed { job_id, .. }
         | DownloadEvent::Cancelled { job_id, .. } => *job_id,
     }
 }
@@ -663,11 +770,11 @@ mod tests {
                 return Ok(RemoteDownload::AlreadyComplete { expected_size: 5 });
             }
             let remaining = b"hello"[offset as usize..].to_vec();
-            let body = stream::once(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(Bytes::from(remaining))
-            })
-            .boxed();
+            let body = stream::iter(remaining).then(|byte| async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(Bytes::from(vec![byte]))
+            });
+            let body = body.boxed();
             if offset == 0 {
                 Ok(RemoteDownload::Full {
                     stream: body,
@@ -763,6 +870,98 @@ mod tests {
             manager.snapshot(job_id).await.unwrap().state,
             DownloadJobState::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn pause_resume_and_stop_preserve_partial_job_state() {
+        let manager = DownloadManager::new();
+        let provider = Arc::new(SlowProvider::new());
+        let temporary = tempfile::tempdir().unwrap();
+        let mut receiver = manager.subscribe();
+        let job_id = manager
+            .submit(
+                provider.clone(),
+                provider.file(),
+                temporary.path().to_path_buf(),
+                DownloadOptions {
+                    overwrite: false,
+                    resume: true,
+                    concurrency: 1,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    receiver.recv().await.unwrap(),
+                    DownloadEvent::Progress {
+                        file_written: 1..5,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(manager.pause(job_id).await);
+        assert_eq!(
+            manager.snapshot(job_id).await.unwrap().state,
+            DownloadJobState::Paused
+        );
+        assert!(temporary.path().join("hello.txt.part").exists());
+        manager
+            .resume_paused(job_id, provider.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    receiver.recv().await.unwrap(),
+                    DownloadEvent::Finished {
+                        job_id: finished,
+                        ..
+                    } if finished == job_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(temporary.path().join("hello.txt"))
+                .await
+                .unwrap(),
+            b"hello"
+        );
+
+        let stop_root = temporary.path().join("stopped");
+        let stopped = manager
+            .submit(
+                provider.clone(),
+                provider.file(),
+                stop_root,
+                DownloadOptions {
+                    overwrite: false,
+                    resume: true,
+                    concurrency: 1,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(manager.pause(stopped).await);
+        assert!(manager.cancel(stopped).await);
+        let snapshot = manager.snapshot(stopped).await.unwrap();
+        assert_eq!(snapshot.state, DownloadJobState::Cancelled);
+        assert!(snapshot.transfers.values().all(|transfer| {
+            transfer.state == TransferState::Interrupted
+                && transfer.error.as_deref() == Some("stopped by user")
+        }));
     }
 
     #[tokio::test]

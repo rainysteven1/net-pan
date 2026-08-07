@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
@@ -101,8 +102,7 @@ impl NetworkSettings {
 }
 
 pub fn default_settings_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set; cannot locate settings file")?;
-    Ok(PathBuf::from(home).join(".config/pan-tui/config.toml"))
+    crate::paths::settings_path()
 }
 
 fn normalize_proxy(value: Option<&str>) -> Option<String> {

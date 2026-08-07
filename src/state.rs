@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -77,7 +77,7 @@ impl StateStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&connection)?;
+        initialize_schema(&connection)?;
         restrict_file(path)?;
         restrict_sqlite_sidecars(path)?;
         Ok(Self {
@@ -256,6 +256,32 @@ impl StateStore {
                 )?;
             }
             DownloadEvent::Progress { .. } => {}
+            DownloadEvent::Retrying {
+                job_id,
+                transfer_id,
+                path,
+                offset,
+                attempt,
+                max_attempts,
+                error,
+                ..
+            } => {
+                let detail =
+                    format!("stream retry {attempt}/{max_attempts} at byte {offset}: {error}");
+                upsert_transfer(
+                    &connection,
+                    TransferUpdate {
+                        job_id: *job_id,
+                        transfer_id: transfer_id.0,
+                        path,
+                        state: "running",
+                        size: None,
+                        written: *offset,
+                        error: Some(&detail),
+                        now,
+                    },
+                )?;
+            }
             DownloadEvent::FileSkipped {
                 job_id,
                 transfer_id,
@@ -335,12 +361,30 @@ impl StateStore {
             DownloadEvent::Fatal { job_id, error, .. } => {
                 update_job_state(&connection, *job_id, "failed", now, None, Some(error))?;
             }
+            DownloadEvent::Paused { job_id, .. } => {
+                update_job_state(&connection, *job_id, "paused", now, None, None)?;
+                let job_id = sqlite_u64(job_id.0, "job ID")?;
+                connection.execute(
+                    "UPDATE transfers SET state='paused', updated_at_ms=?2
+                     WHERE job_id=?1 AND state IN ('queued', 'running')",
+                    params![job_id, now],
+                )?;
+            }
+            DownloadEvent::Resumed { job_id, .. } => {
+                update_job_state(&connection, *job_id, "queued", now, None, None)?;
+                let job_id = sqlite_u64(job_id.0, "job ID")?;
+                connection.execute(
+                    "UPDATE transfers SET state='queued', error=NULL, updated_at_ms=?2
+                     WHERE job_id=?1 AND state='paused'",
+                    params![job_id, now],
+                )?;
+            }
             DownloadEvent::Cancelled { job_id, .. } => {
                 update_job_state(&connection, *job_id, "cancelled", now, None, None)?;
                 let job_id = sqlite_u64(job_id.0, "job ID")?;
                 connection.execute(
-                    "UPDATE transfers SET state='interrupted', updated_at_ms=?2
-                     WHERE job_id=?1 AND state IN ('queued', 'running')",
+                    "UPDATE transfers SET state='interrupted', error='stopped by user', updated_at_ms=?2
+                     WHERE job_id=?1 AND state IN ('queued', 'running', 'paused')",
                     params![job_id, now],
                 )?;
             }
@@ -637,18 +681,11 @@ pub fn default_state_db_path() -> Result<PathBuf> {
 }
 
 pub fn default_state_root() -> Result<PathBuf> {
-    if let Some(root) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(root).join("pan-tui"));
-    }
-    let home = env::var_os("HOME").context("HOME is not set; cannot locate state database")?;
-    Ok(PathBuf::from(home).join(".local/state/pan-tui"))
+    crate::paths::state_root()
 }
 
-fn migrate(connection: &Connection) -> Result<()> {
+fn initialize_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        bail!("state database schema {version} is newer than supported {SCHEMA_VERSION}");
-    }
     if version == 0 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
@@ -705,48 +742,10 @@ fn migrate(connection: &Connection) -> Result<()> {
              PRAGMA user_version=3;
              COMMIT;",
         )?;
-    } else if version == 1 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE notification_outbox (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               idempotency_key TEXT NOT NULL UNIQUE,
-               notifier_id TEXT NOT NULL,
-               event_json TEXT NOT NULL,
-               state TEXT NOT NULL DEFAULT 'pending',
-               attempts INTEGER NOT NULL DEFAULT 0,
-               next_attempt_at_ms INTEGER NOT NULL,
-               last_error TEXT,
-               created_at_ms INTEGER NOT NULL,
-               updated_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX notification_outbox_due
-               ON notification_outbox(state, next_attempt_at_ms, id);
-             PRAGMA user_version=2;
-             COMMIT;",
-        )?;
-    }
-    if version <= 2 {
-        let has_table: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipc_submissions')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_table {
-            connection.execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE TABLE ipc_submissions (
-                   client_id TEXT NOT NULL,
-                   request_id TEXT NOT NULL,
-                   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-                   request_json TEXT NOT NULL,
-                   created_at_ms INTEGER NOT NULL,
-                   PRIMARY KEY(client_id, request_id)
-                 );
-                 PRAGMA user_version=3;
-                 COMMIT;",
-            )?;
-        }
+    } else if version != SCHEMA_VERSION {
+        bail!(
+            "state database schema {version} is unsupported; this development build requires schema {SCHEMA_VERSION}"
+        );
     }
     Ok(())
 }
@@ -864,6 +863,7 @@ fn parse_job_state(state: &str) -> Result<DownloadJobState> {
         "queued" => Ok(DownloadJobState::Queued),
         "scanning" => Ok(DownloadJobState::Scanning),
         "running" => Ok(DownloadJobState::Running),
+        "paused" => Ok(DownloadJobState::Paused),
         "finished" => Ok(DownloadJobState::Finished),
         "failed" => Ok(DownloadJobState::Failed),
         "cancelled" => Ok(DownloadJobState::Cancelled),
@@ -876,6 +876,7 @@ fn parse_transfer_state(state: &str) -> Result<TransferState> {
     match state {
         "queued" => Ok(TransferState::Queued),
         "running" => Ok(TransferState::Running),
+        "paused" => Ok(TransferState::Paused),
         "completed" => Ok(TransferState::Completed),
         "skipped" => Ok(TransferState::Skipped),
         "failed" => Ok(TransferState::Failed),
@@ -1081,7 +1082,7 @@ mod tests {
         connection.pragma_update(None, "user_version", 99).unwrap();
         drop(connection);
         let error = StateStore::open(&path).err().unwrap().to_string();
-        assert!(error.contains("newer than supported"));
+        assert!(error.contains("schema 99 is unsupported"));
     }
 
     #[test]
@@ -1139,6 +1140,74 @@ mod tests {
         let transfer = snapshot.transfers.get(&TransferId(3)).unwrap();
         assert_eq!(transfer.state, TransferState::Completed);
         assert_eq!(transfer.written, 10);
+    }
+
+    #[test]
+    fn persists_pause_resume_and_manual_stop_states() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&temporary.path().join("state.db")).unwrap();
+        let provider = target().reference.identity;
+        store.record_submission(JobId(10), &request()).unwrap();
+        store
+            .record_event(&DownloadEvent::TransferQueued {
+                job_id: JobId(10),
+                provider: provider.clone(),
+                transfer_id: TransferId(1),
+                path: PathBuf::from("large.bin"),
+                size: Some(100),
+            })
+            .unwrap();
+        store
+            .record_progress_batch(&[TransferProgress {
+                job_id: JobId(10),
+                transfer_id: TransferId(1),
+                written: 40,
+                size: Some(100),
+            }])
+            .unwrap();
+        store
+            .record_event(&DownloadEvent::Paused {
+                job_id: JobId(10),
+                provider: provider.clone(),
+            })
+            .unwrap();
+        let paused = store.load_snapshots().unwrap().pop().unwrap();
+        assert_eq!(paused.state, DownloadJobState::Paused);
+        assert_eq!(
+            paused.transfers[&TransferId(1)].state,
+            TransferState::Paused
+        );
+        assert_eq!(paused.transfers[&TransferId(1)].written, 40);
+
+        store
+            .record_event(&DownloadEvent::Resumed {
+                job_id: JobId(10),
+                provider: provider.clone(),
+            })
+            .unwrap();
+        let resumed = store.load_snapshots().unwrap().pop().unwrap();
+        assert_eq!(resumed.state, DownloadJobState::Queued);
+        assert_eq!(
+            resumed.transfers[&TransferId(1)].state,
+            TransferState::Queued
+        );
+
+        store
+            .record_event(&DownloadEvent::Cancelled {
+                job_id: JobId(10),
+                provider,
+            })
+            .unwrap();
+        let stopped = store.load_snapshots().unwrap().pop().unwrap();
+        assert_eq!(stopped.state, DownloadJobState::Cancelled);
+        assert_eq!(
+            stopped.transfers[&TransferId(1)].state,
+            TransferState::Interrupted
+        );
+        assert_eq!(
+            stopped.transfers[&TransferId(1)].error.as_deref(),
+            Some("stopped by user")
+        );
     }
 
     #[test]
@@ -1202,24 +1271,14 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_one_to_notification_outbox() {
+    fn rejects_older_database_schemas() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("state.db");
         let connection = Connection::open(&path).unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
 
-        let store = StateStore::open(&path).unwrap();
-        assert!(
-            store
-                .load_due_notifications(Utc::now().timestamp_millis(), 10)
-                .unwrap()
-                .is_empty()
-        );
-        let connection = store.connection.lock().unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 3);
+        let error = StateStore::open(&path).err().unwrap().to_string();
+        assert!(error.contains("schema 1 is unsupported"));
     }
 }

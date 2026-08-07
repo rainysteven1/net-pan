@@ -25,9 +25,14 @@ pub trait PanClient: Send + Sync {
     async fn refresh_item(&self, item: &RemoteRef) -> Result<RemoteItem>;
     async fn save_provider_settings(
         &self,
-        provider_id: &ProviderId,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> Result<ProviderSettingsSaveResult>;
+    async fn create_profile(
+        &self,
+        provider_id: &ProviderId,
+        name: &str,
+    ) -> Result<ProviderCatalogEntry>;
     async fn reconfigure_network(
         &self,
         network: NetworkSettings,
@@ -39,6 +44,8 @@ pub trait PanClient: Send + Sync {
         options: DownloadOptions,
     ) -> Result<JobId>;
     async fn cancel(&self, job_id: JobId) -> Result<bool>;
+    async fn pause(&self, job_id: JobId) -> Result<bool>;
+    async fn resume_job(&self, job_id: JobId) -> Result<bool>;
     async fn jobs(&self) -> Result<Vec<DownloadJobSnapshot>>;
     async fn try_next_update(&self) -> Option<JobUpdate>;
     async fn reconnect_if_needed(&self);
@@ -137,14 +144,27 @@ impl PanClient for EmbeddedPanClient {
 
     async fn save_provider_settings(
         &self,
-        provider_id: &ProviderId,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> Result<ProviderSettingsSaveResult> {
         Ok(self
             .providers
             .write()
             .await
-            .save_provider_settings(provider_id, changes)
+            .save_provider_settings(identity, changes)
+            .await?)
+    }
+
+    async fn create_profile(
+        &self,
+        provider_id: &ProviderId,
+        name: &str,
+    ) -> Result<ProviderCatalogEntry> {
+        Ok(self
+            .providers
+            .write()
+            .await
+            .create_profile(provider_id, name)
             .await?)
     }
 
@@ -176,6 +196,26 @@ impl PanClient for EmbeddedPanClient {
 
     async fn cancel(&self, job_id: JobId) -> Result<bool> {
         self.jobs.lock().await.cancel(job_id).await
+    }
+
+    async fn pause(&self, job_id: JobId) -> Result<bool> {
+        self.jobs.lock().await.pause(job_id).await
+    }
+
+    async fn resume_job(&self, job_id: JobId) -> Result<bool> {
+        let snapshot = self
+            .jobs
+            .lock()
+            .await
+            .snapshots()
+            .await?
+            .into_iter()
+            .find(|snapshot| snapshot.id == job_id)
+            .ok_or_else(|| anyhow::anyhow!("download Job {} was not found", job_id.0))?;
+        let provider = self
+            .provider_for(&snapshot.request.target.reference.identity)
+            .await?;
+        self.jobs.lock().await.resume_paused(job_id, provider).await
     }
 
     async fn jobs(&self) -> Result<Vec<DownloadJobSnapshot>> {
@@ -228,11 +268,21 @@ impl PanClient for DaemonPanClient {
 
     async fn save_provider_settings(
         &self,
-        provider_id: &ProviderId,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> Result<ProviderSettingsSaveResult> {
         self.daemon
-            .save_provider_settings(provider_id.clone(), changes.clone())
+            .save_provider_settings(identity.clone(), changes.clone())
+            .await
+    }
+
+    async fn create_profile(
+        &self,
+        provider_id: &ProviderId,
+        name: &str,
+    ) -> Result<ProviderCatalogEntry> {
+        self.daemon
+            .create_profile(provider_id.clone(), name.to_owned())
             .await
     }
 
@@ -258,6 +308,15 @@ impl PanClient for DaemonPanClient {
 
     async fn cancel(&self, job_id: JobId) -> Result<bool> {
         self.jobs.lock().await.cancel(job_id).await
+    }
+
+    async fn pause(&self, job_id: JobId) -> Result<bool> {
+        self.jobs.lock().await.pause(job_id).await
+    }
+
+    async fn resume_job(&self, job_id: JobId) -> Result<bool> {
+        self.daemon.resume(job_id).await?;
+        Ok(true)
     }
 
     async fn jobs(&self) -> Result<Vec<DownloadJobSnapshot>> {

@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -27,10 +27,10 @@ use crate::{
         ProviderRuntime, ProviderSettingsSaveResult, RemoteItem, RemoteRef, RemoteSource,
     },
     settings::NetworkSettings,
-    state::{StateStore, default_state_db_path, default_state_root},
+    state::{StateStore, default_state_root},
 };
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,8 +56,12 @@ pub enum IpcCommand {
         item: RemoteRef,
     },
     SaveProviderSettings {
-        provider_id: ProviderId,
+        identity: ProviderIdentity,
         changes: BTreeMap<String, String>,
+    },
+    CreateProfile {
+        provider_id: ProviderId,
+        name: String,
     },
     ReconfigureNetwork {
         network: NetworkSettings,
@@ -66,6 +70,12 @@ pub enum IpcCommand {
         request: Box<DownloadJobRequest>,
     },
     Cancel {
+        job_id: JobId,
+    },
+    Pause {
+        job_id: JobId,
+    },
+    Resume {
         job_id: JobId,
     },
     Subscribe {
@@ -103,6 +113,9 @@ pub enum IpcResult {
     ProviderSettingsSaved {
         outcome: ProviderSettingsSaveResult,
     },
+    ProfileCreated {
+        profile: ProviderCatalogEntry,
+    },
     NetworkReconfigured {
         providers: Vec<ProviderCatalogEntry>,
     },
@@ -111,6 +124,12 @@ pub enum IpcResult {
         reused: bool,
     },
     Cancelled {
+        job_id: JobId,
+    },
+    Paused {
+        job_id: JobId,
+    },
+    Resumed {
         job_id: JobId,
     },
     Snapshot {
@@ -216,18 +235,25 @@ impl DaemonRuntime {
                     item: provider.refresh_item(&item).await.map_err(provider_error)?,
                 })
             }
-            IpcCommand::SaveProviderSettings {
-                provider_id,
-                changes,
-            } => {
+            IpcCommand::SaveProviderSettings { identity, changes } => {
                 let outcome = self
                     .providers
                     .write()
                     .await
-                    .save_provider_settings(&provider_id, &changes)
+                    .save_provider_settings(&identity, &changes)
                     .await
                     .map_err(provider_error)?;
                 Ok(IpcResult::ProviderSettingsSaved { outcome })
+            }
+            IpcCommand::CreateProfile { provider_id, name } => {
+                let profile = self
+                    .providers
+                    .write()
+                    .await
+                    .create_profile(&provider_id, &name)
+                    .await
+                    .map_err(provider_error)?;
+                Ok(IpcResult::ProfileCreated { profile })
             }
             IpcCommand::ReconfigureNetwork { network } => {
                 let providers = self
@@ -262,6 +288,31 @@ impl DaemonRuntime {
                     });
                 }
                 Ok(IpcResult::Cancelled { job_id })
+            }
+            IpcCommand::Pause { job_id } => {
+                if !self.jobs.pause(job_id).await {
+                    return Err(IpcError {
+                        code: "job_not_active".to_owned(),
+                        message: format!("Job {} is not active", job_id.0),
+                        retryable: false,
+                    });
+                }
+                Ok(IpcResult::Paused { job_id })
+            }
+            IpcCommand::Resume { job_id } => {
+                let snapshot = self.jobs.snapshot(job_id).await.ok_or_else(|| IpcError {
+                    code: "job_not_found".to_owned(),
+                    message: format!("Job {} was not found", job_id.0),
+                    retryable: false,
+                })?;
+                let provider = self.provider_for(&snapshot.request).await.ok_or_else(|| {
+                    provider_unavailable(&snapshot.request.target.reference.identity)
+                })?;
+                self.jobs
+                    .resume_paused(job_id, provider)
+                    .await
+                    .map_err(internal_error)?;
+                Ok(IpcResult::Resumed { job_id })
             }
             IpcCommand::Subscribe { .. } => Err(IpcError {
                 code: "invalid_request".to_owned(),
@@ -422,13 +473,7 @@ pub async fn subscribe(
 }
 
 pub fn default_socket_path() -> Result<PathBuf> {
-    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
-        return Ok(PathBuf::from(runtime).join("pan-tui.sock"));
-    }
-    Ok(default_state_db_path()?
-        .parent()
-        .expect("state database always has a parent")
-        .join("pan-tui.sock"))
+    Ok(default_state_root()?.join("net-pan.sock"))
 }
 
 pub fn load_or_create_client_id() -> Result<String> {
@@ -639,7 +684,7 @@ async fn prepare_socket(socket: &Path) -> Result<()> {
             }
         }
         match UnixStream::connect(socket).await {
-            Ok(_) => bail!("another pan-tui daemon is already running"),
+            Ok(_) => bail!("another net-pan daemon is already running"),
             Err(_) => fs::remove_file(socket).with_context(|| {
                 format!("failed to remove stale daemon socket: {}", socket.display())
             })?,
@@ -960,6 +1005,82 @@ mod tests {
         let _ = stop.send(());
         server.await.unwrap();
         assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn create_profile_and_save_settings_are_scoped_by_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = crate::provider::ProviderContext {
+            config_root: temporary.path().join("config"),
+            network: NetworkSettings::default(),
+        };
+        let mut registry = crate::provider::ProviderRegistry::new();
+        registry
+            .register(crate::provider::google::GoogleProviderFactory)
+            .unwrap();
+        let providers = ProviderRuntime::from_registry(&registry, context).await;
+        let state = StateStore::open(&temporary.path().join("state.db")).unwrap();
+        let runtime = DaemonRuntime::new(DownloadManager::new(), state, providers);
+        let first = match runtime
+            .execute("profile-client", 1, IpcCommand::Providers)
+            .await
+            .unwrap()
+        {
+            IpcResult::Providers { providers } => providers[0].clone(),
+            _ => panic!("expected Provider catalog"),
+        };
+        let second = match runtime
+            .execute(
+                "profile-client",
+                2,
+                IpcCommand::CreateProfile {
+                    provider_id: ProviderId::new("google").unwrap(),
+                    name: "Personal Google".to_owned(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            IpcResult::ProfileCreated { profile } => profile,
+            _ => panic!("expected created Profile"),
+        };
+        assert_ne!(first.identity, second.identity);
+
+        let saved = runtime
+            .execute(
+                "profile-client",
+                3,
+                IpcCommand::SaveProviderSettings {
+                    identity: second.identity.clone(),
+                    changes: BTreeMap::from([("name".to_owned(), "Archive Google".to_owned())]),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            saved,
+            IpcResult::ProviderSettingsSaved { ref outcome }
+                if outcome.provider.identity == second.identity
+                    && outcome.provider.profile_name == "Archive Google"
+        ));
+
+        let catalog = match runtime
+            .execute("profile-client", 4, IpcCommand::Providers)
+            .await
+            .unwrap()
+        {
+            IpcResult::Providers { providers } => providers,
+            _ => panic!("expected Provider catalog"),
+        };
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|entry| entry.identity == first.identity)
+                .unwrap()
+                .profile_name,
+            first.profile_name
+        );
     }
 
     #[tokio::test]

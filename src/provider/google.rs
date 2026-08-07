@@ -14,11 +14,11 @@ use crate::{
         CredentialStore, GoogleAuthorizationSession, GoogleInstalledTokenProvider,
         ServiceAccountTokenProvider,
     },
-    config::{LegacyGoogleConfig, NetworkOverride, ProviderConfigStore},
+    config::{NetworkOverride, ProviderConfigStore},
     drive::{DriveClient, DriveReference, parse_drive_reference, response_error},
     model::DriveItem,
     provider::{
-        CloudProvider, DownloadCapability, ProfileId, ProviderAuthState, ProviderAuthStatus,
+        CloudProvider, DownloadCapability, ProviderAuthState, ProviderAuthStatus,
         ProviderCapabilities, ProviderContext, ProviderError, ProviderErrorKind, ProviderFactory,
         ProviderId, ProviderIdentity, ProviderLoginRequest, ProviderReadiness, ProviderResult,
         ProviderSettingKind, ProviderSettingSpec, ProviderSettingsSnapshot, RemoteChecksum,
@@ -31,7 +31,10 @@ use crate::{
 const PROVIDER_ID: &str = "google";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleProviderConfig {
+    #[serde(default)]
+    pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -56,6 +59,7 @@ pub enum GoogleAuthMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleSourceConfig {
     pub id: String,
     pub url: String,
@@ -85,53 +89,79 @@ impl ProviderFactory for GoogleProviderFactory {
     fn settings_schema(&self) -> Vec<ProviderSettingSpec> {
         vec![
             ProviderSettingSpec {
+                key: "name",
+                label: "Account name",
+                description: "User-defined Account name shown in net-pan; changing it does not change the stable ProfileId or stored Jobs.",
+                kind: ProviderSettingKind::Text,
+                required: true,
+            },
+            ProviderSettingSpec {
                 key: "enabled",
                 label: "Enabled",
+                description: "Enables this Google Drive Provider; disable it to stop connecting without deleting its configuration.",
                 kind: ProviderSettingKind::Boolean,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "auth_mode",
                 label: "Authentication mode",
+                description: "Use installed_app for interactive user OAuth or service_account for a service-account credentials file.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "credentials_file",
                 label: "Credentials JSON",
+                description: "Path to the Google OAuth desktop-client or service-account credentials JSON selected by Authentication mode.",
                 kind: ProviderSettingKind::Path,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "token_file",
                 label: "OAuth token state",
+                description: "Private Installed App OAuth token cache; refreshes are persisted atomically with 0600 permissions.",
                 kind: ProviderSettingKind::Path,
                 required: false,
             },
             ProviderSettingSpec {
                 key: "sources_file",
                 label: "Sources JSON",
+                description: "JSON file containing saved Google Drive links shown in Files before a Source is opened.",
                 kind: ProviderSettingKind::Path,
                 required: false,
             },
             ProviderSettingSpec {
                 key: "sources",
                 label: "Saved folders",
+                description: "Summary of configured links; select a saved link in Files and press Enter to open it.",
                 kind: ProviderSettingKind::Action,
                 required: true,
             },
             ProviderSettingSpec {
                 key: "proxy",
                 label: "Provider proxy",
+                description: "Overrides the global application proxy for Google Drive; blank inherits it. System proxy environment variables are ignored.",
                 kind: ProviderSettingKind::Text,
                 required: false,
             },
         ]
     }
 
-    fn load_settings(&self, context: &ProviderContext) -> ProviderResult<ProviderSettingsSnapshot> {
-        let config = load_config(context)?.unwrap_or_else(default_editable_config);
+    fn load_settings(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderResult<ProviderSettingsSnapshot> {
+        let config = load_config(context, identity)?.unwrap_or_else(default_editable_config);
         let values = BTreeMap::from([
+            (
+                "name".to_owned(),
+                if config.name.trim().is_empty() {
+                    identity.profile_id.to_string()
+                } else {
+                    config.name
+                },
+            ),
             ("enabled".to_owned(), config.enabled.to_string()),
             (
                 "auth_mode".to_owned(),
@@ -166,25 +196,20 @@ impl ProviderFactory for GoogleProviderFactory {
         Ok(ProviderSettingsSnapshot {
             values,
             configured_secrets: Default::default(),
-            read_only_reason: context
-                .config_overrides
-                .contains_key(&google_id())
-                .then(|| "Google settings are overridden by CLI or environment".to_owned()),
+            read_only_reason: None,
         })
     }
 
     fn save_settings(
         &self,
         context: &ProviderContext,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> ProviderResult<()> {
-        if context.config_overrides.contains_key(&google_id()) {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Config,
-                "Google settings are read-only while CLI or environment overrides are active",
-            ));
+        let mut config = load_config(context, identity)?.unwrap_or_else(default_editable_config);
+        if let Some(value) = changes.get("name") {
+            config.name = validate_account_name(value)?;
         }
-        let mut config = load_config(context)?.unwrap_or_else(default_editable_config);
         if let Some(value) = changes.get("enabled") {
             config.enabled = parse_bool_setting("enabled", value)?;
         }
@@ -224,20 +249,28 @@ impl ProviderFactory for GoogleProviderFactory {
         let contents = toml::to_string_pretty(&config)
             .map_err(|error| provider_error(ProviderErrorKind::Internal, error))?;
         ProviderConfigStore::new(context.config_root.clone())
-            .write_config(&google_id(), contents.as_bytes())
+            .write_config(identity, contents.as_bytes())
             .map_err(|error| provider_error(ProviderErrorKind::Config, error))
     }
 
-    fn readiness(&self, context: &ProviderContext) -> ProviderReadiness {
-        match load_config(context) {
+    fn readiness(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderReadiness {
+        match load_config(context, identity) {
             Ok(Some(config)) if !config.enabled => ProviderReadiness::Disabled,
             Ok(Some(_)) | Err(_) => ProviderReadiness::ReadyToConnect,
             Ok(None) => ProviderReadiness::NeedsConfig,
         }
     }
 
-    async fn create(&self, context: ProviderContext) -> ProviderResult<Arc<dyn CloudProvider>> {
-        let config = load_config(&context)?.ok_or_else(|| {
+    async fn create(
+        &self,
+        context: ProviderContext,
+        identity: ProviderIdentity,
+    ) -> ProviderResult<Arc<dyn CloudProvider>> {
+        let config = load_config(&context, &identity)?.ok_or_else(|| {
             ProviderError::new(ProviderErrorKind::Config, "Google Drive is not configured")
         })?;
         if !config.enabled {
@@ -248,11 +281,11 @@ impl ProviderFactory for GoogleProviderFactory {
         }
 
         let store = ProviderConfigStore::new(context.config_root.clone());
-        let base = store.providers_dir();
+        let base = store.profile_dir(&identity);
         let credentials = resolve_path(&base, &config.credentials_file);
         let network_override = match config.proxy.as_deref() {
             None => NetworkOverride::Inherit,
-            Some(value) if value.trim().is_empty() => NetworkOverride::Direct,
+            Some(value) if value.trim().is_empty() => NetworkOverride::Inherit,
             Some(value) => NetworkOverride::Proxy(value.to_owned()),
         };
         let network = network_override.effective(&context.network);
@@ -274,20 +307,24 @@ impl ProviderFactory for GoogleProviderFactory {
         let sources = resolve_sources(&base, &config).await?;
 
         Ok(Arc::new(GoogleProvider {
-            identity: ProviderIdentity::new(google_id(), ProfileId::new("default").unwrap()),
+            identity,
             drive,
             sources,
         }))
     }
 
-    fn auth_status(&self, context: &ProviderContext) -> ProviderResult<ProviderAuthStatus> {
-        let Some(config) = load_config(context)? else {
+    fn auth_status(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderResult<ProviderAuthStatus> {
+        let Some(config) = load_config(context, identity)? else {
             return Ok(ProviderAuthStatus::SignedOut);
         };
         if config.auth_mode == GoogleAuthMode::ServiceAccount {
             return Ok(ProviderAuthStatus::Ready);
         }
-        let base = ProviderConfigStore::new(context.config_root.clone()).providers_dir();
+        let base = ProviderConfigStore::new(context.config_root.clone()).profile_dir(identity);
         Ok(
             if CredentialStore::new(resolve_path(&base, &config.token_file)).exists() {
                 ProviderAuthStatus::Ready
@@ -300,6 +337,7 @@ impl ProviderFactory for GoogleProviderFactory {
     async fn login(
         &self,
         context: &ProviderContext,
+        identity: &ProviderIdentity,
         request: ProviderLoginRequest,
     ) -> ProviderResult<ProviderAuthState> {
         if !matches!(request, ProviderLoginRequest::Interactive) {
@@ -308,7 +346,7 @@ impl ProviderFactory for GoogleProviderFactory {
                 "Google only supports interactive login through this command",
             ));
         }
-        let config = load_config(context)?.ok_or_else(|| {
+        let config = load_config(context, identity)?.ok_or_else(|| {
             ProviderError::new(ProviderErrorKind::Config, "Google Drive is not configured")
         })?;
         if config.auth_mode != GoogleAuthMode::InstalledApp {
@@ -317,10 +355,10 @@ impl ProviderFactory for GoogleProviderFactory {
                 "set Google auth_mode to installed_app before interactive login",
             ));
         }
-        let base = ProviderConfigStore::new(context.config_root.clone()).providers_dir();
+        let base = ProviderConfigStore::new(context.config_root.clone()).profile_dir(identity);
         let network = match config.proxy.as_deref() {
             None => NetworkOverride::Inherit,
-            Some(value) if value.trim().is_empty() => NetworkOverride::Direct,
+            Some(value) if value.trim().is_empty() => NetworkOverride::Inherit,
             Some(value) => NetworkOverride::Proxy(value.to_owned()),
         }
         .effective(&context.network);
@@ -346,8 +384,12 @@ impl ProviderFactory for GoogleProviderFactory {
         })
     }
 
-    async fn revoke(&self, context: &ProviderContext) -> ProviderResult<()> {
-        let config = load_config(context)?.ok_or_else(|| {
+    async fn revoke(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderResult<()> {
+        let config = load_config(context, identity)?.ok_or_else(|| {
             ProviderError::new(ProviderErrorKind::Config, "Google Drive is not configured")
         })?;
         if config.auth_mode != GoogleAuthMode::InstalledApp {
@@ -356,7 +398,7 @@ impl ProviderFactory for GoogleProviderFactory {
                 "service-account profiles do not have a local OAuth token to revoke",
             ));
         }
-        let base = ProviderConfigStore::new(context.config_root.clone()).providers_dir();
+        let base = ProviderConfigStore::new(context.config_root.clone()).profile_dir(identity);
         CredentialStore::new(resolve_path(&base, &config.token_file))
             .remove()
             .map_err(|error| provider_error(ProviderErrorKind::Internal, error))?;
@@ -494,7 +536,12 @@ impl CloudProvider for GoogleProvider {
         }
         let stream = response
             .bytes_stream()
-            .map(|chunk| chunk.map_err(|error| provider_error(ProviderErrorKind::Network, error)))
+            .map(|chunk| {
+                chunk.map_err(|error| {
+                    let detail = format!("{:#}", anyhow::Error::new(error));
+                    provider_error(ProviderErrorKind::Network, detail)
+                })
+            })
             .boxed();
         if status == StatusCode::PARTIAL_CONTENT && offset > 0 {
             Ok(RemoteDownload::Partial {
@@ -558,28 +605,18 @@ impl GoogleProvider {
     }
 }
 
-fn load_config(context: &ProviderContext) -> ProviderResult<Option<GoogleProviderConfig>> {
-    if let Some(contents) = context.config_overrides.get(&google_id()) {
-        return parse_config(contents).map(Some);
-    }
+fn load_config(
+    context: &ProviderContext,
+    identity: &ProviderIdentity,
+) -> ProviderResult<Option<GoogleProviderConfig>> {
     let store = ProviderConfigStore::new(context.config_root.clone());
     if let Some(contents) = store
-        .read_config(&google_id())
+        .read_config(identity)
         .map_err(|error| provider_error(ProviderErrorKind::Config, error))?
     {
         return parse_config(&contents).map(Some);
     }
-    Ok(
-        LegacyGoogleConfig::discover(&store).map(|legacy| GoogleProviderConfig {
-            enabled: true,
-            auth_mode: GoogleAuthMode::ServiceAccount,
-            credentials_file: legacy.credentials_path,
-            token_file: default_token_file(),
-            sources_file: Some(legacy.sources_path),
-            sources: Vec::new(),
-            proxy: None,
-        }),
-    )
+    Ok(None)
 }
 
 fn parse_config(contents: &[u8]) -> ProviderResult<GoogleProviderConfig> {
@@ -683,24 +720,42 @@ fn google_id() -> ProviderId {
 
 fn default_editable_config() -> GoogleProviderConfig {
     GoogleProviderConfig {
-        enabled: true,
+        name: String::new(),
+        enabled: false,
         auth_mode: GoogleAuthMode::ServiceAccount,
-        credentials_file: PathBuf::from("google/service-account.json"),
+        credentials_file: PathBuf::from("credentials.json"),
         token_file: default_token_file(),
-        sources_file: Some(PathBuf::from("google/sources.json")),
+        sources_file: Some(PathBuf::from("sources.json")),
         sources: Vec::new(),
         proxy: None,
     }
 }
 
 fn default_token_file() -> PathBuf {
-    PathBuf::from("google/oauth-token.json")
+    PathBuf::from("token.json")
+}
+
+fn validate_account_name(value: &str) -> ProviderResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name cannot be blank",
+        ));
+    }
+    if value.chars().count() > 64 || value.chars().any(char::is_control) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name must be at most 64 characters and contain no control characters",
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_auth_mode(value: &str) -> ProviderResult<GoogleAuthMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "service_account" | "service-account" => Ok(GoogleAuthMode::ServiceAccount),
-        "installed_app" | "installed-app" | "oauth" => Ok(GoogleAuthMode::InstalledApp),
+        "service_account" => Ok(GoogleAuthMode::ServiceAccount),
+        "installed_app" => Ok(GoogleAuthMode::InstalledApp),
         _ => Err(ProviderError::new(
             ProviderErrorKind::Config,
             "Google auth_mode must be service_account or installed_app",
@@ -746,7 +801,6 @@ mod tests {
         ProviderContext {
             config_root: root.to_owned(),
             network: Default::default(),
-            config_overrides: BTreeMap::new(),
         }
     }
 
@@ -761,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_inline_and_legacy_source_config() {
+    fn parses_inline_and_file_backed_source_config() {
         let inline = parse_config(
             br#"
                 credentials_file = "google/service-account.json"
@@ -774,7 +828,7 @@ mod tests {
         assert_eq!(inline.sources.len(), 1);
         assert!(inline.sources_file.is_none());
 
-        let legacy = parse_config(
+        let file_backed = parse_config(
             br#"
                 credentials_file = "/tmp/service-account.json"
                 sources_file = "/tmp/sources.json"
@@ -782,7 +836,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            legacy.sources_file.as_deref(),
+            file_backed.sources_file.as_deref(),
             Some(Path::new("/tmp/sources.json"))
         );
     }
@@ -790,6 +844,20 @@ mod tests {
     #[test]
     fn rejects_config_without_sources() {
         assert!(parse_config(br#"credentials_file = "/tmp/key.json""#).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_provider_config_fields() {
+        assert!(
+            parse_config(
+                br#"
+                    credentials_file = "/tmp/key.json"
+                    sources_file = "/tmp/sources.json"
+                    legacy_credentials = "/tmp/old.json"
+                "#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -803,36 +871,28 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let context = settings_context(temporary.path());
         let factory = GoogleProviderFactory;
-        let snapshot = factory.load_settings(&context).unwrap();
+        let identity = ProviderConfigStore::new(context.config_root.clone())
+            .create_profile(&google_id())
+            .unwrap();
+        let snapshot = factory.load_settings(&context, &identity).unwrap();
         assert_eq!(
             snapshot.values.get("credentials_file").unwrap(),
-            "google/service-account.json"
+            "credentials.json"
         );
         factory
             .save_settings(
                 &context,
+                &identity,
                 &BTreeMap::from([
-                    (
-                        "credentials_file".to_owned(),
-                        "google/test-key.json".to_owned(),
-                    ),
-                    (
-                        "sources_file".to_owned(),
-                        "google/test-sources.json".to_owned(),
-                    ),
+                    ("credentials_file".to_owned(), "test-key.json".to_owned()),
+                    ("sources_file".to_owned(), "test-sources.json".to_owned()),
                     ("proxy".to_owned(), "http://127.0.0.1:7890".to_owned()),
                 ]),
             )
             .unwrap();
-        let saved = load_config(&context).unwrap().unwrap();
-        assert_eq!(
-            saved.credentials_file,
-            PathBuf::from("google/test-key.json")
-        );
-        assert_eq!(
-            saved.sources_file,
-            Some(PathBuf::from("google/test-sources.json"))
-        );
+        let saved = load_config(&context, &identity).unwrap().unwrap();
+        assert_eq!(saved.credentials_file, PathBuf::from("test-key.json"));
+        assert_eq!(saved.sources_file, Some(PathBuf::from("test-sources.json")));
         assert_eq!(saved.proxy.as_deref(), Some("http://127.0.0.1:7890"));
     }
 }

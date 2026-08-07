@@ -65,7 +65,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::provider::{CloudProvider, ProviderContext, ProviderReadiness, ProviderResult};
+    use crate::provider::{
+        CloudProvider, ProviderContext, ProviderIdentity, ProviderReadiness, ProviderResult,
+    };
 
     struct FakeFactory;
 
@@ -79,13 +81,18 @@ mod tests {
             "Fake"
         }
 
-        fn readiness(&self, _context: &ProviderContext) -> ProviderReadiness {
+        fn readiness(
+            &self,
+            _context: &ProviderContext,
+            _identity: &ProviderIdentity,
+        ) -> ProviderReadiness {
             ProviderReadiness::NeedsConfig
         }
 
         async fn create(
             &self,
             _context: ProviderContext,
+            _identity: ProviderIdentity,
         ) -> ProviderResult<Arc<dyn CloudProvider>> {
             unreachable!("needs-config factories are not created")
         }

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.95.0
+
+jobs:
+  linux-quality:
+    name: Privacy, lint, test, and build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run full project checks
+        run: |
+          chmod +x scripts/*.sh packaging/*.sh
+          ./scripts/check.sh --full
+
+  macos-tests:
+    name: macOS tests
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests with isolated state
+        run: |
+          chmod +x scripts/*.sh packaging/*.sh
+          ./scripts/check.sh --ci \
+            --skip-privacy \
+            --skip-fmt \
+            --skip-check \
+            --skip-clippy
+
+  summary:
+    name: CI summary
+    if: always()
+    needs: [linux-quality, macos-tests]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish job summary
+        run: |
+          {
+            echo "## net-pan CI"
+            echo
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            echo "| Linux quality | ${{ needs.linux-quality.result }} |"
+            echo "| macOS tests | ${{ needs.macos-tests.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          test "${{ needs.linux-quality.result }}" = "success"
+          test "${{ needs.macos-tests.result }}" = "success"

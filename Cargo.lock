@@ -1209,6 +1209,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-pan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hmac",
+ "httpdate",
+ "jsonwebtoken",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "url",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,34 +1328,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
 dependencies = [
  "libm",
-]
-
-[[package]]
-name = "pan-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-recursion",
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "futures-util",
- "getrandom 0.3.4",
- "hmac",
- "httpdate",
- "jsonwebtoken",
- "ratatui",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
- "url",
 ]
 
 [[package]]

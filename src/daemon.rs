@@ -98,21 +98,35 @@ impl DaemonClient {
 
     pub async fn save_provider_settings(
         &self,
-        provider_id: ProviderId,
+        identity: ProviderIdentity,
         changes: std::collections::BTreeMap<String, String>,
     ) -> Result<ProviderSettingsSaveResult> {
         match self
             .request(
                 Self::new_request_id()?,
-                IpcCommand::SaveProviderSettings {
-                    provider_id,
-                    changes,
-                },
+                IpcCommand::SaveProviderSettings { identity, changes },
             )
             .await?
         {
             IpcResult::ProviderSettingsSaved { outcome } => Ok(outcome),
             _ => bail!("daemon returned an unexpected SaveProviderSettings response"),
+        }
+    }
+
+    pub async fn create_profile(
+        &self,
+        provider_id: ProviderId,
+        name: String,
+    ) -> Result<ProviderCatalogEntry> {
+        match self
+            .request(
+                Self::new_request_id()?,
+                IpcCommand::CreateProfile { provider_id, name },
+            )
+            .await?
+        {
+            IpcResult::ProfileCreated { profile } => Ok(profile),
+            _ => bail!("daemon returned an unexpected CreateProfile response"),
         }
     }
 
@@ -156,6 +170,28 @@ impl DaemonClient {
             Ok(result)
         } else {
             bail!("daemon returned an unexpected cancel response")
+        }
+    }
+
+    pub async fn pause(&self, job_id: JobId) -> Result<IpcResult> {
+        let result = self
+            .request(Self::new_request_id()?, IpcCommand::Pause { job_id })
+            .await?;
+        if matches!(result, IpcResult::Paused { .. }) {
+            Ok(result)
+        } else {
+            bail!("daemon returned an unexpected pause response")
+        }
+    }
+
+    pub async fn resume(&self, job_id: JobId) -> Result<IpcResult> {
+        let result = self
+            .request(Self::new_request_id()?, IpcCommand::Resume { job_id })
+            .await?;
+        if matches!(result, IpcResult::Resumed { .. }) {
+            Ok(result)
+        } else {
+            bail!("daemon returned an unexpected resume response")
         }
     }
 

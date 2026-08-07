@@ -1,4 +1,13 @@
 /target/
+/dist/
+/bin/
+
+# net-pan runtime state must never enter the repository
+/.net-pan/
+*.sqlite
+*.sqlite3
+*.db
+*.log
 
 # Local credentials and environment files
 .env
@@ -7,6 +16,9 @@ credentials*.json
 service-account*.json
 *.pem
 *.key
+*.p12
+*.pfx
+token.json
 
 # Editor and operating-system files
 .idea/

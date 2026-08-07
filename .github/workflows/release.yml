@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.95.0
+
+jobs:
+  validate:
+    name: Validate release metadata and privacy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and Cargo version
+        id: meta
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "release tag must match v<major>.<minor>.<patch>" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$manifest_version" != "$version" ]]; then
+            echo "Cargo.toml version $manifest_version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Run privacy and release checks
+        run: |
+          chmod +x scripts/*.sh packaging/*.sh
+          ./scripts/privacy-check.sh --history
+          ./scripts/check.sh --ci --skip-privacy
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          chmod +x packaging/*.sh
+          ./packaging/package.sh \
+            --version "${{ needs.validate.outputs.tag }}" \
+            --target "${{ matrix.target }}" \
+            --skip-build
+
+          host_target="$(rustc -vV | awk '/^host:/ {print $2}')"
+          verify_args=()
+          if [[ "$host_target" == "${{ matrix.target }}" ]]; then
+            verify_args+=(--run-binary)
+          fi
+          ./packaging/verify-package.sh "${verify_args[@]}" \
+            "dist/net-pan-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}.tar.gz"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-pan-${{ matrix.platform }}
+          path: dist/net-pan-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: net-pan-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare release assets and checksums
+        shell: bash
+        run: |
+          cp packaging/install-release.sh release-assets/install.sh
+          chmod +x release-assets/install.sh
+          cd release-assets
+          sha256sum net-pan-*.tar.gz > checksums.txt
+          test "$(find . -maxdepth 1 -name 'net-pan-*.tar.gz' | wc -l)" -eq 3
+
+      - name: Generate Homebrew formula
+        shell: bash
+        run: |
+          chmod +x packaging/*.sh
+          ./packaging/generate-homebrew-formula.sh \
+            --version "${{ needs.validate.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --assets-dir release-assets \
+            --output release-assets/net-pan.rb
+
+      - name: Generate release notes
+        id: git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: git-cliff-release-notes.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: net-pan ${{ needs.validate.outputs.tag }}
+          body: ${{ steps.git-cliff.outputs.content }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/net-pan-*.tar.gz
+            release-assets/checksums.txt
+            release-assets/net-pan.rb
+            release-assets/install.sh

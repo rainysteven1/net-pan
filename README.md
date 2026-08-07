@@ -1,5 +1,9 @@
 # net-pan
 
+[![CI](https://github.com/rainysteven1/net-pan/actions/workflows/ci.yml/badge.svg)](https://github.com/rainysteven1/net-pan/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rainysteven1/net-pan)](https://github.com/rainysteven1/net-pan/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `net-pan` is a Rust terminal downloader for cloud-drive folders. The goal is a small TUI that lets
 you open saved netdisk sources, browse one level at a time, and download the highlighted item to a
 local directory.
@@ -169,17 +173,46 @@ capability surface but are not implemented by the current Aliyun adapter.
 
 ## Build and Run
 
+Install the latest Linux or macOS release. The installer downloads the matching archive and refuses
+to install it unless SHA-256 verification succeeds:
+
+```bash
+curl -fsSL https://github.com/rainysteven1/net-pan/releases/latest/download/install.sh | bash
+```
+
+The default install directory is `~/.local/bin`. Override it with `NET_PAN_INSTALL_DIR`.
+
+Release assets also include `net-pan.rb`, generated from the checksums of the exact Linux x86_64
+and macOS x86_64/arm64 archives. A tap maintainer can publish it without rebuilding binaries.
+
 Build a release binary:
 
 ```bash
 cargo build --release
 ```
 
+Project engineering commands are exposed through `just`:
+
+```bash
+just check --full
+just package
+just verify-package dist/net-pan-v0.1.0-linux-x86_64.tar.gz
+just homebrew-formula v0.1.0
+```
+
 Start the interactive browser with the default destination:
 
 ```bash
-cargo run --release
+net-pan
 ```
+
+Only one interactive TUI may run for the current user. A second invocation exits with the PID of
+the existing TUI. Closing its terminal or sending SIGHUP/SIGTERM restores the terminal and releases
+the instance lock. This restriction does not apply to `--list`, script CLI commands, or the daemon.
+
+From a source checkout, the equivalent command is `cargo run --release`. Cargo requires `--` only
+when forwarding CLI arguments, for example `cargo run --release -- status`; the installed binary
+uses the normal `net-pan status` form.
 
 Choose an initial Provider and destination:
 
@@ -292,6 +325,7 @@ URLs, secrets, signatures, and signed download URLs are not written to Job histo
 | `Left` / `Right` | Move between Navigation and the current page |
 | `Up` / `Down`, then `Enter` | Select and open a Navigation route |
 | `Tab` / `Shift-Tab` | Switch subpanes only on pages that contain multiple panes |
+| `l` | Open Runtime Logs from any main page |
 | `g` | Open the separate Global Settings layer |
 | `Backspace` | Return from Global Settings or the current breadcrumb level |
 | `p` | Open the current Account's Source selector from Files |
@@ -309,8 +343,8 @@ held by an active download job.
 
 | Key | Action |
 |---|---|
-| `Up` / `k` | Select the previous item |
-| `Down` / `j` | Select the next item |
+| `Up` | Select the previous item |
+| `Down` | Select the next item |
 | `PageUp` / `PageDown` | Move by one page |
 | `Home` / `End` | Select the first or last item |
 | `Enter` | Open the selected saved link |
@@ -321,7 +355,7 @@ held by an active download job.
 
 | Key | Action |
 |---|---|
-| `Up` / `k`, `Down` / `j` | Move the selection |
+| `Up` / `Down` | Move the selection |
 | `PageUp` / `PageDown`, `Home` / `End` | Move by a page or jump to an edge |
 | `Enter` / `Right` | Open the highlighted child folder; hidden for other item types |
 | `Backspace` | Return to the parent level |
@@ -351,18 +385,27 @@ speed column before truncating the percentage or byte counts. Use `Space` to pau
 current Job and `x` to stop it. Pausing retains `.part` files and the original Job ID; stopping is a
 manual failure shown as `STOP` and written at `ERROR` level. The selected Transfer's complete path
 and error chain are shown in the Detail area instead of replacing its progress cell.
+The completion summary reports `All` as the sum of Downloaded, Skipped, and Failed. The final
+Runtime Log also aggregates skip reasons, so a Job skipped because every destination already exists
+is explained without inspecting thousands of individual rows.
 
 ### Logs Tab
 
 | Key | Action |
 |---|---|
-| `Up` / `k`, `Down` / `j` | Scroll one log entry |
+| `Up` / `Down` | Scroll one log entry |
 | `PageUp` / `PageDown` | Scroll one page |
 | `Home` / `End` | Jump to the first or latest filtered entry |
 | `a` | Show all levels |
 | `i` | Show `INFO` entries |
 | `e` | Show `ERROR` entries |
+| `f` | Cycle target: All, Runtime, Provider, Source, Daemon, Settings, Download |
 | `Tab` / `Shift-Tab` | Switch between the log list and detail pane |
+
+Runtime Logs use one chronological session stream and one rotated file. Provider and Source events
+are entries in that global stream rather than separate files, so initialization, refresh, directory
+loads, daemon disconnects, settings rebuilds, and downloads can be correlated in order. Level and
+target filters are independent and only affect the TUI view, not what is persisted.
 
 ## Download Behavior
 
@@ -377,7 +420,8 @@ in this version. Items whose owner disabled downloading are also skipped.
 When interrupted, a partially downloaded file remains as `<name>.part`. The next default run
 requests the remaining bytes and validates the returned `Content-Range`. A completed stream is
 size-checked when the provider reports a size, synchronized to storage, and renamed to the final
-path.
+path. If the final local file already exists, it is skipped without opening a Provider download
+stream unless `--overwrite` was explicitly enabled.
 
 ## Local State And Logs
 
@@ -404,8 +448,9 @@ Each process writes immediately flushed, Loguru-style lines under:
 ~/.net-pan/logs/YYYY-MM-DD/net-pan_HH-mm-ss_000.log
 ```
 
-Files rotate at 10 MiB by incrementing the final number. Planning, file starts, completed files,
-skipped files, and summaries use `INFO`; failed files and fatal errors use `ERROR`.
+Files rotate at 10 MiB by incrementing the final number. The stream includes runtime startup,
+Provider/Source initialization and refresh, directory loads, daemon disconnects, settings saves and
+rebuilds, plus download events. Normal lifecycle events use `INFO`; failed operations use `ERROR`.
 
 ## Global Settings
 
@@ -417,6 +462,8 @@ existing absolute real directory; relative, missing, regular-file, and symbolic-
 rejected. Saving it changes the root used by every subsequent Job. Enter an absolute HTTP or HTTPS
 proxy URL, or clear it for a direct connection; changing the proxy reconnects Providers. `Esc`
 stops editing, and `Backspace` returns from the layer when no field is being edited.
+An active Job keeps the destination captured when it was submitted; changing the global root does
+not move open files or `.part` data. The save Toast states this explicitly.
 Successful saves keep the Settings page open, leave editing mode, and show a centered confirmation
 Toast for two seconds. Validation and write failures keep the field in editing mode.
 
@@ -452,11 +499,33 @@ rows. Provider saves use the same centered two-second Toast behavior.
 ## Development Checks
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+just check --ci
 ```
+
+Without `just`:
+
+```bash
+./scripts/check.sh --ci
+```
+
+Useful engineering commands:
+
+```bash
+just fmt
+just privacy
+just build
+just package
+just changelog
+just release-check 0.1.0
+```
+
+`release-check` never commits, tags, pushes, or publishes. Tag-driven GitHub Actions build Linux
+x86_64 and macOS x86_64/arm64 archives, attach SHA-256 checksums, and publish the checksum-verifying
+installer. See [docs/releasing.md](docs/releasing.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Repository files are checked for credentials, personal home paths, private infrastructure, and
+consumer email addresses. The release gate also checks Git author/committer email domains. Runtime
+configuration under `~/.net-pan` is excluded from packages and must never be committed.
 
 The architecture and gated implementation record are maintained in [DESIGN.md](DESIGN.md) and
 [TODO.md](TODO.md). Those two planning documents are intentionally written in Chinese.
@@ -464,3 +533,7 @@ The architecture and gated implementation record are maintained in [DESIGN.md](D
 The TUI shell and interaction hierarchy adapt MIT-licensed layout patterns from
 [`cc-switch-cli`](https://github.com/saladday/cc-switch-cli). See
 [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) for attribution and license terms.
+
+The check scripts, packaging layout, checksum installer, and tag-driven release structure were
+inspired by [`box-link`](https://github.com/SZ-surveying/box-link), then adapted for a provider-based
+Linux/macOS downloader with stricter privacy and release-permission boundaries.

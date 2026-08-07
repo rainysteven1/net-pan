@@ -316,7 +316,6 @@ pub enum RemoteDownload {
 pub struct ProviderContext {
     pub config_root: PathBuf,
     pub network: NetworkSettings,
-    pub config_overrides: BTreeMap<ProviderId, Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,6 +338,7 @@ pub enum ProviderSettingKind {
 pub struct ProviderSettingSpec {
     pub key: &'static str,
     pub label: &'static str,
+    pub description: &'static str,
     pub kind: ProviderSettingKind,
     pub required: bool,
 }
@@ -347,6 +347,7 @@ pub struct ProviderSettingSpec {
 pub struct ProviderSetting {
     pub key: String,
     pub label: String,
+    pub description: String,
     pub kind: ProviderSettingKind,
     pub required: bool,
 }
@@ -356,6 +357,7 @@ impl From<ProviderSettingSpec> for ProviderSetting {
         Self {
             key: value.key.to_owned(),
             label: value.label.to_owned(),
+            description: value.description.to_owned(),
             kind: value.kind,
             required: value.required,
         }
@@ -379,12 +381,14 @@ pub trait ProviderFactory: Send + Sync {
     fn load_settings(
         &self,
         _context: &ProviderContext,
+        _identity: &ProviderIdentity,
     ) -> ProviderResult<ProviderSettingsSnapshot> {
         Ok(ProviderSettingsSnapshot::default())
     }
     fn save_settings(
         &self,
         _context: &ProviderContext,
+        _identity: &ProviderIdentity,
         _changes: &BTreeMap<String, String>,
     ) -> ProviderResult<()> {
         Err(ProviderError::new(
@@ -392,14 +396,27 @@ pub trait ProviderFactory: Send + Sync {
             "this provider does not expose editable settings",
         ))
     }
-    fn readiness(&self, context: &ProviderContext) -> ProviderReadiness;
-    async fn create(&self, context: ProviderContext) -> ProviderResult<Arc<dyn CloudProvider>>;
-    fn auth_status(&self, _context: &ProviderContext) -> ProviderResult<ProviderAuthStatus> {
+    fn readiness(
+        &self,
+        context: &ProviderContext,
+        identity: &ProviderIdentity,
+    ) -> ProviderReadiness;
+    async fn create(
+        &self,
+        context: ProviderContext,
+        identity: ProviderIdentity,
+    ) -> ProviderResult<Arc<dyn CloudProvider>>;
+    fn auth_status(
+        &self,
+        _context: &ProviderContext,
+        _identity: &ProviderIdentity,
+    ) -> ProviderResult<ProviderAuthStatus> {
         Ok(ProviderAuthStatus::Unsupported)
     }
     async fn login(
         &self,
         _context: &ProviderContext,
+        _identity: &ProviderIdentity,
         _request: ProviderLoginRequest,
     ) -> ProviderResult<ProviderAuthState> {
         Err(ProviderError::new(
@@ -407,7 +424,11 @@ pub trait ProviderFactory: Send + Sync {
             "this provider does not expose an interactive login flow",
         ))
     }
-    async fn revoke(&self, _context: &ProviderContext) -> ProviderResult<()> {
+    async fn revoke(
+        &self,
+        _context: &ProviderContext,
+        _identity: &ProviderIdentity,
+    ) -> ProviderResult<()> {
         Err(ProviderError::new(
             ProviderErrorKind::Unsupported,
             "this provider does not expose a revocation flow",
@@ -503,5 +524,29 @@ mod tests {
         assert!(!item.is_folder());
         assert!(item.can_download());
         assert!(item.supports_resume());
+    }
+
+    #[test]
+    fn setting_descriptions_are_complete_and_required_by_ipc() {
+        let schemas = [
+            google::GoogleProviderFactory.settings_schema(),
+            aliyun::AliyunProviderFactory.settings_schema(),
+        ];
+        for schema in schemas {
+            assert!(!schema.is_empty());
+            assert!(
+                schema
+                    .iter()
+                    .all(|setting| !setting.description.trim().is_empty())
+            );
+        }
+
+        let incomplete_payload = r#"{
+            "key":"proxy",
+            "label":"Provider proxy",
+            "kind":"Text",
+            "required":false
+        }"#;
+        assert!(serde_json::from_str::<ProviderSetting>(incomplete_payload).is_err());
     }
 }

@@ -1,7 +1,15 @@
 [package]
-name = "pan-tui"
+name = "net-pan"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Provider-neutral TUI and daemon for downloading cloud-drive files"
+license = "MIT"
+repository = "https://github.com/rainysteven1/net-pan"
+homepage = "https://github.com/rainysteven1/net-pan"
+readme = "README.md"
+keywords = ["cloud-drive", "download", "tui", "google-drive", "aliyun-drive"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 anyhow = "1.0.104"

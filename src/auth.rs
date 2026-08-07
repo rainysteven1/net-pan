@@ -90,7 +90,7 @@ impl ServiceAccountTokenProvider {
             .configure_client(reqwest::Client::builder())?
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
-            .user_agent(concat!("pan-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("net-pan/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to create OAuth HTTP client")?;
         Ok(Arc::new(Self {
@@ -426,7 +426,7 @@ impl GoogleAuthorizationSession {
         })
         .await
         .context("Google OAuth callback timed out")??;
-        const CALLBACK_BODY: &str = "pan-tui authorization completed. You may close this tab.";
+        const CALLBACK_BODY: &str = "net-pan authorization completed. You may close this tab.";
         stream
             .write_all(
                 format!(
@@ -495,7 +495,7 @@ fn oauth_http_client(settings: &NetworkSettings) -> Result<reqwest::Client> {
         .configure_client(reqwest::Client::builder())?
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
-        .user_agent(concat!("pan-tui/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("net-pan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to create Google OAuth HTTP client")
 }

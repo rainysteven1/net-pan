@@ -187,6 +187,33 @@ impl JobBackend {
             }
         }
     }
+
+    pub async fn pause(&self, job_id: JobId) -> Result<bool> {
+        match self {
+            Self::Embedded(embedded) => Ok(embedded.manager.pause(job_id).await),
+            Self::Daemon(daemon) => {
+                daemon.client.pause(job_id).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub async fn resume_paused(
+        &self,
+        job_id: JobId,
+        provider: Arc<dyn CloudProvider>,
+    ) -> Result<bool> {
+        match self {
+            Self::Embedded(embedded) => {
+                embedded.manager.resume_paused(job_id, provider).await?;
+                Ok(true)
+            }
+            Self::Daemon(daemon) => {
+                daemon.client.resume(job_id).await?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 async fn submit_daemon(

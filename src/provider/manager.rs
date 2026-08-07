@@ -2,6 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ProviderConfigStore;
+
 use super::{
     CloudProvider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFactory, ProviderId,
     ProviderIdentity, ProviderReadiness, ProviderRegistry, ProviderResult, ProviderSetting,
@@ -23,6 +25,7 @@ pub struct ProviderCatalogEntry {
     pub id: ProviderId,
     pub display_name: String,
     pub identity: ProviderIdentity,
+    pub profile_name: String,
     pub status: ProviderStatus,
     pub available: bool,
     pub settings_schema: Vec<ProviderSetting>,
@@ -61,39 +64,65 @@ impl ProviderSlot {
 
 #[derive(Default)]
 pub struct ProviderManager {
-    slots: BTreeMap<ProviderId, ProviderSlot>,
+    factories: BTreeMap<ProviderId, Arc<dyn ProviderFactory>>,
+    slots: BTreeMap<ProviderIdentity, ProviderSlot>,
 }
 
 impl ProviderManager {
-    pub fn from_registry(registry: &ProviderRegistry) -> Self {
-        let slots = registry
+    pub fn from_registry(registry: &ProviderRegistry, context: &ProviderContext) -> Self {
+        let factories: BTreeMap<_, _> = registry
             .iter()
-            .map(|(id, factory)| {
-                (
-                    id.clone(),
-                    ProviderSlot {
-                        factory: Arc::clone(factory),
-                        status: ProviderStatus::Disabled,
-                        instance: None,
-                    },
-                )
+            .map(|(id, factory)| (id.clone(), Arc::clone(factory)))
+            .collect();
+        let store = ProviderConfigStore::new(context.config_root.clone());
+        let slots = factories
+            .iter()
+            .flat_map(|(id, factory)| {
+                let mut profiles = store.list_profiles(id).unwrap_or_default();
+                if profiles.is_empty()
+                    && let Ok(identity) = store.create_profile(id)
+                {
+                    let changes = BTreeMap::from([(
+                        "name".to_owned(),
+                        format!("{} Account", factory.display_name()),
+                    )]);
+                    if factory.save_settings(context, &identity, &changes).is_ok() {
+                        profiles.push(identity.profile_id);
+                    } else {
+                        let _ = store.remove_profile(&identity);
+                    }
+                }
+                profiles
+                    .into_iter()
+                    .map(|profile_id| {
+                        let identity = ProviderIdentity::new(id.clone(), profile_id);
+                        (
+                            identity.clone(),
+                            ProviderSlot {
+                                factory: Arc::clone(factory),
+                                status: ProviderStatus::Disabled,
+                                instance: None,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
-        Self { slots }
+        Self { factories, slots }
     }
 
     pub async fn initialize(&mut self, context: &ProviderContext) {
-        let ids: Vec<_> = self.slots.keys().cloned().collect();
-        for id in ids {
-            self.initialize_one(&id, context.clone()).await;
+        let identities: Vec<_> = self.slots.keys().cloned().collect();
+        for identity in identities {
+            self.initialize_one(&identity, context.clone()).await;
         }
     }
 
-    pub async fn initialize_one(&mut self, id: &ProviderId, context: ProviderContext) {
-        let Some(slot) = self.slots.get_mut(id) else {
+    pub async fn initialize_one(&mut self, identity: &ProviderIdentity, context: ProviderContext) {
+        let Some(slot) = self.slots.get_mut(identity) else {
             return;
         };
-        match slot.factory.readiness(&context) {
+        match slot.factory.readiness(&context, identity) {
             ProviderReadiness::Disabled => {
                 slot.status = ProviderStatus::Disabled;
                 slot.instance = None;
@@ -104,7 +133,7 @@ impl ProviderManager {
             }
             ProviderReadiness::ReadyToConnect => {
                 slot.status = ProviderStatus::Connecting;
-                match slot.factory.create(context).await {
+                match slot.factory.create(context, identity.clone()).await {
                     Ok(instance) => {
                         slot.status = ProviderStatus::Ready;
                         slot.instance = Some(instance);
@@ -121,17 +150,57 @@ impl ProviderManager {
         }
     }
 
-    pub fn get(&self, id: &ProviderId) -> Option<&ProviderSlot> {
-        self.slots.get(id)
+    pub fn get(&self, identity: &ProviderIdentity) -> Option<&ProviderSlot> {
+        self.slots.get(identity)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ProviderId, &ProviderSlot)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ProviderIdentity, &ProviderSlot)> {
         self.slots.iter()
+    }
+
+    pub async fn create_profile(
+        &mut self,
+        provider_id: &ProviderId,
+        name: &str,
+        context: &ProviderContext,
+    ) -> ProviderResult<ProviderIdentity> {
+        validate_profile_name(name)?;
+        let factory = self.factories.get(provider_id).cloned().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::NotFound,
+                format!("provider {provider_id} is not registered"),
+            )
+        })?;
+        let store = ProviderConfigStore::new(context.config_root.clone());
+        let identity = store.create_profile(provider_id).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Config,
+                format!("could not create Account profile: {error:#}"),
+            )
+        })?;
+        if let Err(error) = factory.save_settings(
+            context,
+            &identity,
+            &BTreeMap::from([("name".to_owned(), name.trim().to_owned())]),
+        ) {
+            let _ = store.remove_profile(&identity);
+            return Err(error);
+        }
+        self.slots.insert(
+            identity.clone(),
+            ProviderSlot {
+                factory,
+                status: ProviderStatus::Disabled,
+                instance: None,
+            },
+        );
+        self.initialize_one(&identity, context.clone()).await;
+        Ok(identity)
     }
 
     fn instance_for(&self, identity: &ProviderIdentity) -> Option<Arc<dyn CloudProvider>> {
         self.slots
-            .get(&identity.provider_id)
+            .get(identity)
             .and_then(ProviderSlot::instance)
             .filter(|provider| provider.identity() == identity)
             .cloned()
@@ -139,20 +208,23 @@ impl ProviderManager {
 
     async fn save_and_rebuild(
         &mut self,
-        id: &ProviderId,
+        identity: &ProviderIdentity,
         context: &ProviderContext,
         changes: &BTreeMap<String, String>,
     ) -> ProviderResult<bool> {
-        let slot = self.slots.get_mut(id).ok_or_else(|| {
+        let slot = self.slots.get_mut(identity).ok_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::NotFound,
-                format!("provider {id} is not registered"),
+                format!(
+                    "provider {}/{} is not registered",
+                    identity.provider_id, identity.profile_id
+                ),
             )
         })?;
-        slot.factory.save_settings(context, changes)?;
+        slot.factory.save_settings(context, identity, changes)?;
         let previous = slot.instance.clone();
         let retained_previous_instance = previous.is_some();
-        match slot.factory.readiness(context) {
+        match slot.factory.readiness(context, identity) {
             ProviderReadiness::Disabled => {
                 slot.status = ProviderStatus::Disabled;
                 slot.instance = None;
@@ -165,7 +237,7 @@ impl ProviderManager {
             }
             ProviderReadiness::ReadyToConnect => {
                 slot.status = ProviderStatus::Connecting;
-                match slot.factory.create(context.clone()).await {
+                match slot.factory.create(context.clone(), identity.clone()).await {
                     Ok(instance) => {
                         slot.status = ProviderStatus::Ready;
                         slot.instance = Some(instance);
@@ -182,6 +254,30 @@ impl ProviderManager {
     }
 }
 
+fn validate_profile_name(name: &str) -> ProviderResult<()> {
+    let name = name.trim();
+    let length = name.chars().count();
+    if length == 0 {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name cannot be blank",
+        ));
+    }
+    if length > 64 {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name must be 64 characters or fewer",
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Config,
+            "Account name cannot contain control characters",
+        ));
+    }
+    Ok(())
+}
+
 pub struct ProviderRuntime {
     context: ProviderContext,
     manager: ProviderManager,
@@ -189,7 +285,7 @@ pub struct ProviderRuntime {
 
 impl ProviderRuntime {
     pub async fn from_registry(registry: &ProviderRegistry, context: ProviderContext) -> Self {
-        let mut manager = ProviderManager::from_registry(registry);
+        let mut manager = ProviderManager::from_registry(registry, &context);
         manager.initialize(&context).await;
         Self { context, manager }
     }
@@ -212,13 +308,18 @@ impl ProviderRuntime {
                 self.name
             }
 
-            fn readiness(&self, _context: &ProviderContext) -> ProviderReadiness {
+            fn readiness(
+                &self,
+                _context: &ProviderContext,
+                _identity: &ProviderIdentity,
+            ) -> ProviderReadiness {
                 ProviderReadiness::ReadyToConnect
             }
 
             async fn create(
                 &self,
                 _context: ProviderContext,
+                _identity: ProviderIdentity,
             ) -> ProviderResult<Arc<dyn CloudProvider>> {
                 Ok(self.instance.clone())
             }
@@ -227,7 +328,8 @@ impl ProviderRuntime {
         let slots = providers
             .into_iter()
             .map(|instance| {
-                let id = instance.identity().provider_id.clone();
+                let identity = instance.identity().clone();
+                let id = identity.provider_id.clone();
                 let name = Box::leak(id.to_string().into_boxed_str());
                 let factory: Arc<dyn ProviderFactory> = Arc::new(InstanceFactory {
                     id: id.clone(),
@@ -235,7 +337,7 @@ impl ProviderRuntime {
                     instance: instance.clone(),
                 });
                 (
-                    id,
+                    identity.clone(),
                     ProviderSlot {
                         factory,
                         status: ProviderStatus::Ready,
@@ -246,18 +348,20 @@ impl ProviderRuntime {
             .collect();
         Self {
             context: ProviderContext {
-                config_root: std::path::PathBuf::from("/tmp/pan-tui-test"),
+                config_root: std::path::PathBuf::from("/tmp/net-pan-test"),
                 network: crate::settings::NetworkSettings::default(),
-                config_overrides: BTreeMap::new(),
             },
-            manager: ProviderManager { slots },
+            manager: ProviderManager {
+                factories: BTreeMap::new(),
+                slots,
+            },
         }
     }
 
     pub fn catalog(&self) -> Vec<ProviderCatalogEntry> {
         self.manager
             .iter()
-            .map(|(id, slot)| self.catalog_entry(id, slot))
+            .map(|(identity, slot)| self.catalog_entry(identity, slot))
             .collect()
     }
 
@@ -283,21 +387,37 @@ impl ProviderRuntime {
 
     pub async fn save_provider_settings(
         &mut self,
-        id: &ProviderId,
+        identity: &ProviderIdentity,
         changes: &BTreeMap<String, String>,
     ) -> ProviderResult<ProviderSettingsSaveResult> {
         let retained_previous_instance = self
             .manager
-            .save_and_rebuild(id, &self.context, changes)
+            .save_and_rebuild(identity, &self.context, changes)
             .await?;
         let slot = self
             .manager
-            .get(id)
+            .get(identity)
             .expect("saved provider remains registered");
         Ok(ProviderSettingsSaveResult {
-            provider: self.catalog_entry(id, slot),
+            provider: self.catalog_entry(identity, slot),
             retained_previous_instance,
         })
+    }
+
+    pub async fn create_profile(
+        &mut self,
+        provider_id: &ProviderId,
+        name: &str,
+    ) -> ProviderResult<ProviderCatalogEntry> {
+        let identity = self
+            .manager
+            .create_profile(provider_id, name, &self.context)
+            .await?;
+        let slot = self
+            .manager
+            .get(&identity)
+            .expect("created profile remains registered");
+        Ok(self.catalog_entry(&identity, slot))
     }
 
     pub async fn reconfigure_network(
@@ -305,22 +425,24 @@ impl ProviderRuntime {
         network: crate::settings::NetworkSettings,
     ) -> Vec<ProviderCatalogEntry> {
         self.context.network = network;
-        let ids: Vec<_> = self.manager.slots.keys().cloned().collect();
-        for id in ids {
+        let identities: Vec<_> = self.manager.slots.keys().cloned().collect();
+        for identity in identities {
             let previous = self
                 .manager
                 .slots
-                .get(&id)
+                .get(&identity)
                 .and_then(|slot| slot.instance.clone());
-            self.manager.initialize_one(&id, self.context.clone()).await;
-            if self.manager.slots.get(&id).is_some_and(|slot| {
+            self.manager
+                .initialize_one(&identity, self.context.clone())
+                .await;
+            if self.manager.slots.get(&identity).is_some_and(|slot| {
                 slot.instance.is_none()
                     && matches!(
                         slot.status,
                         ProviderStatus::ConfigError(_) | ProviderStatus::ConnectionError(_)
                     )
             }) && previous.is_some()
-                && let Some(slot) = self.manager.slots.get_mut(&id)
+                && let Some(slot) = self.manager.slots.get_mut(&identity)
             {
                 slot.instance = previous;
             }
@@ -344,27 +466,27 @@ impl ProviderRuntime {
         })
     }
 
-    fn catalog_entry(&self, id: &ProviderId, slot: &ProviderSlot) -> ProviderCatalogEntry {
-        let identity = slot.instance.as_ref().map_or_else(
-            || {
-                ProviderIdentity::new(
-                    id.clone(),
-                    super::ProfileId::new("default").expect("static profile ID is valid"),
-                )
-            },
-            |provider| provider.identity().clone(),
-        );
+    fn catalog_entry(
+        &self,
+        identity: &ProviderIdentity,
+        slot: &ProviderSlot,
+    ) -> ProviderCatalogEntry {
         let settings = slot
             .factory
-            .load_settings(&self.context)
+            .load_settings(&self.context, identity)
             .unwrap_or_else(|error| ProviderSettingsSnapshot {
                 read_only_reason: Some(format!("Could not load settings: {error}")),
                 ..ProviderSettingsSnapshot::default()
             });
         ProviderCatalogEntry {
-            id: id.clone(),
+            id: identity.provider_id.clone(),
             display_name: slot.display_name().to_owned(),
-            identity,
+            identity: identity.clone(),
+            profile_name: settings
+                .values
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| identity.profile_id.to_string()),
             status: slot.status.clone(),
             available: slot.instance.is_some(),
             settings_schema: slot
@@ -387,10 +509,7 @@ fn provider_error_status(error: &ProviderError) -> ProviderStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -399,7 +518,7 @@ mod tests {
     use super::*;
     use crate::{
         provider::{
-            DownloadCapability, ProfileId, ProviderCapabilities, ProviderError, ProviderIdentity,
+            DownloadCapability, ProviderCapabilities, ProviderError, ProviderIdentity,
             ProviderResult, ProviderSettingKind, ProviderSettingSpec, RemoteDownload, RemoteItem,
             RemoteItemKind, RemoteObjectId, RemoteRef, RemoteSource, SourceId,
         },
@@ -503,6 +622,7 @@ mod tests {
             vec![ProviderSettingSpec {
                 key: "endpoint",
                 label: "Endpoint",
+                description: "Test endpoint.",
                 kind: ProviderSettingKind::Text,
                 required: true,
             }]
@@ -511,12 +631,13 @@ mod tests {
         fn load_settings(
             &self,
             _context: &ProviderContext,
+            identity: &ProviderIdentity,
         ) -> ProviderResult<ProviderSettingsSnapshot> {
             Ok(ProviderSettingsSnapshot {
-                values: BTreeMap::from([(
-                    "endpoint".to_owned(),
-                    "https://saved.example".to_owned(),
-                )]),
+                values: BTreeMap::from([
+                    ("name".to_owned(), identity.profile_id.to_string()),
+                    ("endpoint".to_owned(), "https://saved.example".to_owned()),
+                ]),
                 ..ProviderSettingsSnapshot::default()
             })
         }
@@ -524,19 +645,27 @@ mod tests {
         fn save_settings(
             &self,
             _context: &ProviderContext,
-            _changes: &BTreeMap<String, String>,
+            _identity: &ProviderIdentity,
+            changes: &BTreeMap<String, String>,
         ) -> ProviderResult<()> {
-            self.fail.store(true, Ordering::SeqCst);
+            if changes.contains_key("endpoint") {
+                self.fail.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
 
-        fn readiness(&self, _context: &ProviderContext) -> ProviderReadiness {
+        fn readiness(
+            &self,
+            _context: &ProviderContext,
+            _identity: &ProviderIdentity,
+        ) -> ProviderReadiness {
             ProviderReadiness::ReadyToConnect
         }
 
         async fn create(
             &self,
             _context: ProviderContext,
+            identity: ProviderIdentity,
         ) -> ProviderResult<Arc<dyn CloudProvider>> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err(ProviderError::new(
@@ -544,12 +673,7 @@ mod tests {
                     "saved endpoint was rejected",
                 ));
             }
-            Ok(Arc::new(FakeProvider {
-                identity: ProviderIdentity::new(
-                    ProviderId::new("rebuild").unwrap(),
-                    ProfileId::new("default").unwrap(),
-                ),
-            }))
+            Ok(Arc::new(FakeProvider { identity }))
         }
     }
 
@@ -563,31 +687,44 @@ mod tests {
             self.id
         }
 
-        fn readiness(&self, _context: &ProviderContext) -> ProviderReadiness {
+        fn save_settings(
+            &self,
+            _context: &ProviderContext,
+            _identity: &ProviderIdentity,
+            _changes: &BTreeMap<String, String>,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn readiness(
+            &self,
+            _context: &ProviderContext,
+            _identity: &ProviderIdentity,
+        ) -> ProviderReadiness {
             self.readiness
         }
 
         async fn create(
             &self,
             _context: ProviderContext,
+            identity: ProviderIdentity,
         ) -> ProviderResult<Arc<dyn CloudProvider>> {
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
-            Ok(Arc::new(FakeProvider {
-                identity: ProviderIdentity::new(
-                    ProviderId::new(self.id).unwrap(),
-                    ProfileId::new("default").unwrap(),
-                ),
-            }))
+            Ok(Arc::new(FakeProvider { identity }))
         }
     }
 
-    fn context() -> ProviderContext {
+    fn context(name: &str) -> ProviderContext {
+        let config_root = std::env::temp_dir().join(format!(
+            "net-pan-manager-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_root);
         ProviderContext {
-            config_root: PathBuf::from("/tmp/pan-tui-test-config"),
+            config_root,
             network: NetworkSettings::default(),
-            config_overrides: BTreeMap::new(),
         }
     }
 
@@ -619,36 +756,37 @@ mod tests {
             })
             .unwrap();
 
-        let mut manager = ProviderManager::from_registry(&registry);
-        manager.initialize(&context()).await;
+        let context = context("initialize");
+        let mut manager = ProviderManager::from_registry(&registry, &context);
+        manager.initialize(&context).await;
 
+        let good = manager
+            .iter()
+            .find(|(identity, _)| identity.provider_id.as_str() == "good")
+            .map(|(identity, _)| identity.clone())
+            .unwrap();
+        let missing = manager
+            .iter()
+            .find(|(identity, _)| identity.provider_id.as_str() == "missing")
+            .map(|(identity, _)| identity.clone())
+            .unwrap();
+        let bad = manager
+            .iter()
+            .find(|(identity, _)| identity.provider_id.as_str() == "bad")
+            .map(|(identity, _)| identity.clone())
+            .unwrap();
+
+        assert_eq!(manager.get(&good).unwrap().status(), &ProviderStatus::Ready);
         assert_eq!(
-            manager
-                .get(&ProviderId::new("good").unwrap())
-                .unwrap()
-                .status(),
-            &ProviderStatus::Ready
-        );
-        assert_eq!(
-            manager
-                .get(&ProviderId::new("missing").unwrap())
-                .unwrap()
-                .status(),
+            manager.get(&missing).unwrap().status(),
             &ProviderStatus::NeedsConfig
         );
         assert_eq!(
-            manager
-                .get(&ProviderId::new("bad").unwrap())
-                .unwrap()
-                .status(),
+            manager.get(&bad).unwrap().status(),
             &ProviderStatus::ConnectionError("authentication failed".to_owned())
         );
 
-        let provider = manager
-            .get(&ProviderId::new("good").unwrap())
-            .unwrap()
-            .instance()
-            .unwrap();
+        let provider = manager.get(&good).unwrap().instance().unwrap();
         let sources = provider.sources().await.unwrap();
         let children = provider
             .list_children(&sources[0].root.reference)
@@ -680,14 +818,13 @@ mod tests {
         let fail = Arc::new(AtomicBool::new(false));
         let mut registry = ProviderRegistry::new();
         registry.register(RebuildFailingFactory { fail }).unwrap();
-        let mut runtime = ProviderRuntime::from_registry(&registry, context()).await;
-        let id = ProviderId::new("rebuild").unwrap();
+        let mut runtime = ProviderRuntime::from_registry(&registry, context("rebuild")).await;
         let identity = runtime.catalog()[0].identity.clone();
         let previous = runtime.provider(&identity).unwrap();
 
         let outcome = runtime
             .save_provider_settings(
-                &id,
+                &identity,
                 &BTreeMap::from([("endpoint".to_owned(), "https://edited.example".to_owned())]),
             )
             .await
@@ -712,5 +849,66 @@ mod tests {
             &previous,
             &runtime.provider(&identity).unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn multiple_accounts_keep_names_settings_and_instances_isolated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = ProviderContext {
+            config_root: temporary.path().to_owned(),
+            network: NetworkSettings::default(),
+        };
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(crate::provider::google::GoogleProviderFactory)
+            .unwrap();
+        let mut runtime = ProviderRuntime::from_registry(&registry, context.clone()).await;
+        let first = runtime.catalog().into_iter().next().unwrap();
+        let second = runtime
+            .create_profile(&ProviderId::new("google").unwrap(), "Personal Google")
+            .await
+            .unwrap();
+
+        assert_ne!(first.identity, second.identity);
+        assert_eq!(second.profile_name, "Personal Google");
+        assert_eq!(runtime.catalog().len(), 2);
+        runtime
+            .save_provider_settings(
+                &second.identity,
+                &BTreeMap::from([("name".to_owned(), "Archive Google".to_owned())]),
+            )
+            .await
+            .unwrap();
+
+        let catalog = runtime.catalog();
+        let unchanged = catalog
+            .iter()
+            .find(|entry| entry.identity == first.identity)
+            .unwrap();
+        let renamed = catalog
+            .iter()
+            .find(|entry| entry.identity == second.identity)
+            .unwrap();
+        assert_eq!(unchanged.profile_name, first.profile_name);
+        assert_eq!(renamed.profile_name, "Archive Google");
+        assert!(runtime.provider(&first.identity).is_none());
+        assert!(runtime.provider(&second.identity).is_none());
+
+        let store = ProviderConfigStore::new(context.config_root);
+        assert_ne!(
+            store.config_path(&first.identity),
+            store.config_path(&second.identity)
+        );
+        assert!(store.config_path(&first.identity).is_file());
+        assert!(store.config_path(&second.identity).is_file());
+    }
+
+    #[test]
+    fn account_names_are_validated_before_profile_creation() {
+        for invalid in ["", "   ", "bad\nname"] {
+            assert!(validate_profile_name(invalid).is_err());
+        }
+        assert!(validate_profile_name(&"x".repeat(65)).is_err());
+        assert!(validate_profile_name("公司 Google 云盘").is_ok());
     }
 }

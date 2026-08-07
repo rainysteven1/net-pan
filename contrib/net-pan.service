@@ -1,11 +1,11 @@
 [Unit]
-Description=pan-tui cloud download daemon
+Description=net-pan cloud download daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/pan-tui daemon
+ExecStart=%h/.local/bin/net-pan daemon
 Restart=on-failure
 RestartSec=5
 

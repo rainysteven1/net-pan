@@ -2,12 +2,12 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     client::PanClient,
-    config::AppConfig,
+    config::{AppConfig, validate_download_destination},
     download::{
         DownloadEvent, DownloadJobState, DownloadOptions, DownloadSummary, JobId, TransferId,
         TransferState, format_bytes,
@@ -29,11 +29,15 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
 };
 
+mod instance;
+mod keymap;
 mod render;
 mod runtime;
 #[cfg(test)]
 mod tests;
+mod theme;
 
+pub use instance::TuiInstanceGuard;
 use render::render_ui;
 #[cfg(test)]
 use runtime::record_download_event;
@@ -45,6 +49,7 @@ enum BrowserMode {
     Confirming,
     Scanning,
     Downloading,
+    Paused,
     Finished,
     Failed,
 }
@@ -57,9 +62,50 @@ enum BrowserLayer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppTab {
+    Accounts,
     Files,
+    Transfers,
     Logs,
     Settings,
+}
+
+impl AppTab {
+    const ALL: [Self; 5] = [
+        Self::Accounts,
+        Self::Files,
+        Self::Transfers,
+        Self::Logs,
+        Self::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accounts => "Accounts",
+            Self::Files => "Files",
+            Self::Transfers => "Transfers",
+            Self::Logs => "Logs",
+            Self::Settings => "Settings",
+        }
+    }
+
+    fn adjacent(self, delta: isize) -> Self {
+        let current = Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .expect("active navigation item is registered");
+        let next = if delta < 0 {
+            (current + Self::ALL.len() - 1) % Self::ALL.len()
+        } else {
+            (current + 1) % Self::ALL.len()
+        };
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationFocus {
+    Navigation,
+    Content,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,24 +114,94 @@ enum PanelFocus {
     Lower,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalSettingField {
+    Destination,
+    Proxy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToastKind {
+    Success,
+    Warning,
+}
+
+#[derive(Clone, Debug)]
+struct Toast {
+    kind: ToastKind,
+    message: String,
+    expires_at: Instant,
+}
+
+impl GlobalSettingField {
+    fn row(self) -> usize {
+        match self {
+            Self::Destination => 0,
+            Self::Proxy => 1,
+        }
+    }
+
+    fn toggle(&mut self) {
+        *self = match self {
+            Self::Destination => Self::Proxy,
+            Self::Proxy => Self::Destination,
+        };
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SettingsForm {
+    destination: String,
     proxy: String,
+    field: GlobalSettingField,
     cursor: usize,
     editing: bool,
     status: String,
 }
 
 impl SettingsForm {
-    fn new(settings: &NetworkSettings) -> Self {
+    fn new(destination: &Path, settings: &NetworkSettings) -> Self {
+        let destination = destination.display().to_string();
         let proxy = settings.proxy_input().to_owned();
-        let cursor = proxy.chars().count();
+        let status = match validate_download_destination(Path::new(&destination)) {
+            Ok(()) => "Download path is ready.".to_owned(),
+            Err(error) => format!("Download path needs attention: {error}"),
+        };
+        let cursor = destination.chars().count();
         Self {
+            destination,
             proxy,
+            field: GlobalSettingField::Destination,
             cursor,
             editing: false,
-            status: "Blank means direct connection; system proxy variables are ignored.".to_owned(),
+            status,
         }
+    }
+
+    fn selected_value(&self) -> &str {
+        match self.field {
+            GlobalSettingField::Destination => &self.destination,
+            GlobalSettingField::Proxy => &self.proxy,
+        }
+    }
+
+    fn selected_value_mut(&mut self) -> &mut String {
+        match self.field {
+            GlobalSettingField::Destination => &mut self.destination,
+            GlobalSettingField::Proxy => &mut self.proxy,
+        }
+    }
+
+    fn select_adjacent(&mut self) {
+        self.field.toggle();
+        self.cursor = self.selected_value().chars().count();
+    }
+
+    fn refresh_status(&mut self) {
+        self.status = match validate_download_destination(Path::new(&self.destination)) {
+            Ok(()) => "Download path is ready.".to_owned(),
+            Err(error) => format!("Download path needs attention: {error}"),
+        };
     }
 }
 
@@ -127,48 +243,81 @@ impl ProviderSettingsForm {
                 }
             })
             .collect();
-        Self {
+        let mut form = Self {
             fields,
             status: snapshot
                 .read_only_reason
                 .clone()
-                .unwrap_or_else(|| "Provider settings are saved independently.".to_owned()),
+                .unwrap_or_else(|| "Ready".to_owned()),
             read_only_reason: snapshot.read_only_reason.clone(),
             ..Self::default()
-        }
+        };
+        form.selected = form.editable_indices().into_iter().next().unwrap_or(0);
+        form
     }
 
     fn selected_field(&self) -> Option<&ProviderField> {
-        self.fields.get(self.selected)
+        self.is_editable(self.selected)
+            .then(|| self.fields.get(self.selected))
+            .flatten()
     }
 
     fn selected_field_mut(&mut self) -> Option<&mut ProviderField> {
+        if !self.is_editable(self.selected) {
+            return None;
+        }
         self.fields.get_mut(self.selected)
     }
 
+    fn is_editable(&self, index: usize) -> bool {
+        self.read_only_reason.is_none()
+            && self
+                .fields
+                .get(index)
+                .is_some_and(|field| field.spec.kind != ProviderSettingKind::Action)
+    }
+
+    fn editable_indices(&self) -> Vec<usize> {
+        (0..self.fields.len())
+            .filter(|index| self.is_editable(*index))
+            .collect()
+    }
+
+    fn read_only_indices(&self) -> Vec<usize> {
+        (0..self.fields.len())
+            .filter(|index| !self.is_editable(*index))
+            .collect()
+    }
+
     fn move_selection(&mut self, delta: isize) {
-        if self.fields.is_empty() {
+        let editable = self.editable_indices();
+        if editable.is_empty() {
             return;
         }
-        let count = self.fields.len();
-        self.selected = if delta < 0 {
-            (self.selected + count - 1) % count
+        let position = editable
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            (position + editable.len() - 1) % editable.len()
         } else {
-            (self.selected + 1) % count
+            (position + 1) % editable.len()
         };
+        self.selected = editable[next];
     }
 
     fn changes(&self) -> BTreeMap<String, String> {
         self.fields
             .iter()
-            .filter(|field| {
-                field.spec.kind != ProviderSettingKind::Action
+            .enumerate()
+            .filter(|(index, field)| {
+                self.is_editable(*index)
                     && field.value != field.original
                     && !(field.spec.kind == ProviderSettingKind::Secret
                         && field.value.is_empty()
                         && field.secret_configured)
             })
-            .map(|field| (field.spec.key.to_owned(), field.value.clone()))
+            .map(|(_, field)| (field.spec.key.to_owned(), field.value.clone()))
             .collect()
     }
 
@@ -230,6 +379,18 @@ enum LogFilter {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LogTargetFilter {
+    #[default]
+    All,
+    Runtime,
+    Provider,
+    Source,
+    Daemon,
+    Settings,
+    Download,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum TransferFilter {
     #[default]
@@ -242,8 +403,11 @@ impl TransferFilter {
     fn matches(self, state: TransferState) -> bool {
         match self {
             Self::All => true,
-            Self::Active => matches!(state, TransferState::Queued | TransferState::Running),
-            Self::Failed => state == TransferState::Failed,
+            Self::Active => matches!(
+                state,
+                TransferState::Queued | TransferState::Running | TransferState::Paused
+            ),
+            Self::Failed => matches!(state, TransferState::Failed | TransferState::Interrupted),
         }
     }
 
@@ -256,37 +420,49 @@ impl TransferFilter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FormField {
-    Destination,
-    Workers,
-}
-
 #[derive(Clone, Debug)]
 struct DownloadForm {
-    destination_root: String,
-    cursor: usize,
     workers: usize,
-    field: FormField,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AccountNameForm {
+    value: String,
+    cursor: usize,
+    status: String,
+}
+
+impl AccountNameForm {
+    fn handle_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                self.cursor = self
+                    .cursor
+                    .saturating_add(1)
+                    .min(self.value.chars().count())
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.value.chars().count(),
+            KeyCode::Backspace if self.cursor > 0 => {
+                remove_char(&mut self.value, self.cursor - 1);
+                self.cursor -= 1;
+            }
+            KeyCode::Delete if self.cursor < self.value.chars().count() => {
+                remove_char(&mut self.value, self.cursor);
+            }
+            KeyCode::Char(character) => {
+                insert_char(&mut self.value, self.cursor, character);
+                self.cursor += 1;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl DownloadForm {
-    fn new(destination: &Path) -> Self {
-        let destination_root = destination.display().to_string();
-        let cursor = destination_root.chars().count();
-        Self {
-            destination_root,
-            cursor,
-            workers: 1,
-            field: FormField::Destination,
-        }
-    }
-
-    fn toggle_field(&mut self) {
-        self.field = match self.field {
-            FormField::Destination => FormField::Workers,
-            FormField::Workers => FormField::Destination,
-        };
+    fn new() -> Self {
+        Self { workers: 1 }
     }
 }
 
@@ -305,6 +481,50 @@ impl LogFilter {
             Self::Info => "Info",
             Self::Error => "Error",
         }
+    }
+}
+
+impl LogTargetFilter {
+    const ORDER: [Self; 7] = [
+        Self::All,
+        Self::Runtime,
+        Self::Provider,
+        Self::Source,
+        Self::Daemon,
+        Self::Settings,
+        Self::Download,
+    ];
+
+    fn matches(self, target: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Runtime => target == "runtime",
+            Self::Provider => target == "provider",
+            Self::Source => target == "source",
+            Self::Daemon => target == "daemon",
+            Self::Settings => target == "settings",
+            Self::Download => target == "download",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All targets",
+            Self::Runtime => "Runtime",
+            Self::Provider => "Provider",
+            Self::Source => "Source",
+            Self::Daemon => "Daemon",
+            Self::Settings => "Settings",
+            Self::Download => "Download",
+        }
+    }
+
+    fn next(self) -> Self {
+        let index = Self::ORDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        Self::ORDER[(index + 1) % Self::ORDER.len()]
     }
 }
 
@@ -345,7 +565,7 @@ impl FolderPage {
 
     fn name(&self) -> &str {
         match &self.location {
-            PageLocation::SharedLinks => "Shared links",
+            PageLocation::SharedLinks => "Sources",
             PageLocation::Folder(folder) => &folder.name,
         }
     }
@@ -366,11 +586,12 @@ impl TransferState {
     fn sort_rank(self) -> u8 {
         match self {
             Self::Running => 0,
-            Self::Failed => 1,
-            Self::Interrupted => 2,
-            Self::Queued => 3,
-            Self::Skipped => 4,
-            Self::Completed => 5,
+            Self::Paused => 1,
+            Self::Failed => 2,
+            Self::Interrupted => 3,
+            Self::Queued => 4,
+            Self::Skipped => 5,
+            Self::Completed => 6,
         }
     }
 
@@ -378,6 +599,7 @@ impl TransferState {
         match self {
             Self::Queued => "WAIT",
             Self::Running => "RUN ",
+            Self::Paused => "PAUSE",
             Self::Completed => "DONE",
             Self::Skipped => "SKIP",
             Self::Failed => "FAIL",
@@ -429,6 +651,7 @@ struct DownloadDisplay {
     skipped: usize,
     failed: usize,
     pre_skipped: usize,
+    skip_reasons: BTreeMap<String, usize>,
     last_issue: Option<String>,
     fatal: Option<String>,
 }
@@ -503,12 +726,18 @@ pub struct BrowserApp {
     download_form: Option<DownloadForm>,
     download: DownloadDisplay,
     active_tab: AppTab,
-    files_focus: PanelFocus,
+    navigation_tab: AppTab,
+    navigation_focus: NavigationFocus,
+    account_selected: usize,
+    account_form: Option<AccountNameForm>,
+    active_accounts: BTreeMap<ProviderId, ProfileId>,
     logs_focus: PanelFocus,
-    settings_focus: PanelFocus,
     network_settings: NetworkSettings,
     settings_form: Option<SettingsForm>,
     provider_form: Option<ProviderSettingsForm>,
+    account_detail_open: bool,
+    global_settings_open: bool,
+    settings_path: PathBuf,
     provider_name: String,
     profile_name: String,
     source_name: String,
@@ -519,9 +748,11 @@ pub struct BrowserApp {
     provider_selector: Option<ProviderSelector>,
     logs: Vec<LogEntry>,
     log_filter: LogFilter,
+    log_target_filter: LogTargetFilter,
     log_offset_from_bottom: usize,
     quit_confirming: bool,
     daemon_mode: bool,
+    toast: Option<Toast>,
 }
 
 #[derive(Clone, Debug)]
@@ -553,6 +784,7 @@ struct ProviderChoice {
     id: ProviderId,
     name: String,
     profile: ProfileId,
+    profile_name: String,
     status: String,
     settings_count: usize,
     sources: Vec<SourceChoice>,
@@ -573,6 +805,7 @@ pub struct BrowserProvider {
     id: ProviderId,
     name: String,
     identity: ProviderIdentity,
+    profile_name: String,
     status: ProviderStatus,
     available: bool,
     settings_schema: Vec<ProviderSetting>,
@@ -587,6 +820,7 @@ impl BrowserProvider {
             id: entry.id,
             name: entry.display_name,
             identity: entry.identity,
+            profile_name: entry.profile_name,
             status: entry.status,
             available: entry.available,
             settings_schema: entry.settings_schema,
@@ -600,6 +834,7 @@ impl BrowserProvider {
         self.id = entry.id;
         self.name = entry.display_name;
         self.identity = entry.identity;
+        self.profile_name = entry.profile_name;
         self.status = entry.status;
         self.available = entry.available;
         self.settings_schema = entry.settings_schema;
@@ -650,7 +885,7 @@ impl BrowserProvider {
             }
             Err(error) => {
                 self.sources.clear();
-                self.source_error = Some(error.to_string());
+                self.source_error = Some(format!("{error:#}"));
             }
         }
     }
@@ -701,12 +936,18 @@ impl BrowserApp {
             download_form: None,
             download: DownloadDisplay::default(),
             active_tab: AppTab::Files,
-            files_focus: PanelFocus::Upper,
+            navigation_tab: AppTab::Files,
+            navigation_focus: NavigationFocus::Content,
+            account_selected: 0,
+            account_form: None,
+            active_accounts: BTreeMap::new(),
             logs_focus: PanelFocus::Upper,
-            settings_focus: PanelFocus::Upper,
             network_settings,
             settings_form: None,
             provider_form: None,
+            account_detail_open: false,
+            global_settings_open: false,
+            settings_path: PathBuf::from("~/.net-pan/settings.toml"),
             provider_name: "Cloud Provider".to_owned(),
             profile_name: "default".to_owned(),
             source_name: "-".to_owned(),
@@ -717,9 +958,29 @@ impl BrowserApp {
             provider_selector: None,
             logs: Vec::new(),
             log_filter: LogFilter::All,
+            log_target_filter: LogTargetFilter::All,
             log_offset_from_bottom: 0,
             quit_confirming: false,
             daemon_mode: false,
+            toast: None,
+        }
+    }
+
+    fn show_toast(&mut self, kind: ToastKind, message: impl Into<String>) {
+        self.toast = Some(Toast {
+            kind,
+            message: message.into(),
+            expires_at: Instant::now() + Duration::from_secs(2),
+        });
+    }
+
+    fn expire_toast(&mut self) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Instant::now() >= toast.expires_at)
+        {
+            self.toast = None;
         }
     }
 
@@ -736,6 +997,8 @@ impl BrowserApp {
                 .map(|source| source.root.clone())
                 .collect(),
         )];
+        self.remember_active_account();
+        self.sync_account_selection();
     }
 
     fn refresh_provider_catalog(&mut self, providers: &[BrowserProvider]) {
@@ -745,6 +1008,7 @@ impl BrowserApp {
                 id: runtime.id.clone(),
                 name: runtime.name.clone(),
                 profile: runtime.identity().profile_id,
+                profile_name: runtime.profile_name.clone(),
                 status: runtime.status_label(),
                 settings_count: runtime.settings_schema.len(),
                 sources: runtime
@@ -760,7 +1024,7 @@ impl BrowserApp {
             .collect();
         let choice = &self.provider_choices[self.active_provider];
         self.provider_name = choice.name.clone();
-        self.profile_name = choice.profile.to_string();
+        self.profile_name = choice.profile_name.clone();
         self.provider_status = choice.status.clone();
         self.provider_settings_count = choice.settings_count;
         if let Some(key) = &self.current_source
@@ -771,6 +1035,136 @@ impl BrowserApp {
         {
             self.source_name = source.name.clone();
         }
+        self.sync_account_selection();
+    }
+
+    fn current_provider_id(&self) -> Option<&ProviderId> {
+        self.provider_choices
+            .get(self.active_provider)
+            .map(|choice| &choice.id)
+    }
+
+    fn account_indices(&self) -> Vec<usize> {
+        let Some(provider_id) = self.current_provider_id() else {
+            return Vec::new();
+        };
+        self.provider_choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| (&choice.id == provider_id).then_some(index))
+            .collect()
+    }
+
+    fn sync_account_selection(&mut self) {
+        let indices = self.account_indices();
+        self.account_selected = indices
+            .iter()
+            .position(|index| *index == self.active_provider)
+            .unwrap_or(0)
+            .min(indices.len().saturating_sub(1));
+    }
+
+    fn move_account_selection(&mut self, delta: isize) {
+        let count = self.account_indices().len();
+        if count == 0 {
+            self.account_selected = 0;
+            return;
+        }
+        self.account_selected = if delta < 0 {
+            (self.account_selected + count - 1) % count
+        } else {
+            (self.account_selected + 1) % count
+        };
+    }
+
+    fn selected_account_provider_index(&self) -> Option<usize> {
+        self.account_indices().get(self.account_selected).copied()
+    }
+
+    fn remember_active_account(&mut self) {
+        if let Some(choice) = self.provider_choices.get(self.active_provider) {
+            self.active_accounts
+                .insert(choice.id.clone(), choice.profile.clone());
+        }
+    }
+
+    fn switch_provider_type(&mut self, delta: isize) -> Option<usize> {
+        let mut provider_ids = Vec::<ProviderId>::new();
+        for choice in &self.provider_choices {
+            if !provider_ids.contains(&choice.id) {
+                provider_ids.push(choice.id.clone());
+            }
+        }
+        let current = self.current_provider_id()?.clone();
+        let current_index = provider_ids.iter().position(|id| id == &current)?;
+        let next_index = if delta < 0 {
+            (current_index + provider_ids.len() - 1) % provider_ids.len()
+        } else {
+            (current_index + 1) % provider_ids.len()
+        };
+        let next_id = &provider_ids[next_index];
+        let remembered = self.active_accounts.get(next_id);
+        self.provider_choices
+            .iter()
+            .position(|choice| {
+                &choice.id == next_id
+                    && remembered
+                        .map(|profile| &choice.profile == profile)
+                        .unwrap_or(true)
+            })
+            .or_else(|| {
+                self.provider_choices
+                    .iter()
+                    .position(|choice| &choice.id == next_id)
+            })
+    }
+
+    fn open_account_form(&mut self) {
+        self.account_form = Some(AccountNameForm {
+            value: String::new(),
+            cursor: 0,
+            status: "Enter an Account name (1-64 characters).".to_owned(),
+        });
+    }
+
+    fn open_global_settings(&mut self) {
+        self.global_settings_open = true;
+        if self.settings_form.is_none() {
+            self.settings_form = Some(SettingsForm::new(&self.destination, &self.network_settings));
+        }
+    }
+
+    fn open_account_detail(&mut self) {
+        self.account_detail_open = true;
+    }
+
+    fn open_provider_settings_page(&mut self) {
+        self.active_tab = AppTab::Settings;
+        self.navigation_tab = AppTab::Settings;
+        self.navigation_focus = NavigationFocus::Content;
+        self.account_detail_open = false;
+    }
+
+    fn provider_settings_visible(&self) -> bool {
+        self.active_tab == AppTab::Settings
+            || (self.active_tab == AppTab::Accounts && self.account_detail_open)
+    }
+
+    fn account_config_path(&self) -> PathBuf {
+        let root = self
+            .settings_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("~/.net-pan"));
+        self.provider_choices
+            .get(self.active_provider)
+            .map(|choice| {
+                root.join("providers")
+                    .join(choice.id.as_str())
+                    .join(choice.profile.as_str())
+                    .join("config.toml")
+            })
+            .unwrap_or_else(|| root.join("providers"))
     }
 
     fn refresh_provider_form(&mut self, runtime: &BrowserProvider) {
@@ -795,22 +1189,6 @@ impl BrowserApp {
             provider: self.active_provider,
             source,
         });
-    }
-
-    fn move_provider_selection(&mut self, delta: isize) {
-        let Some(selector) = self.provider_selector.as_mut() else {
-            return;
-        };
-        let count = self.provider_choices.len();
-        if count == 0 {
-            return;
-        }
-        selector.provider = if delta < 0 {
-            (selector.provider + count - 1) % count
-        } else {
-            (selector.provider + 1) % count
-        };
-        selector.source = 0;
     }
 
     fn move_source_selection(&mut self, delta: isize) {
@@ -851,24 +1229,26 @@ impl BrowserApp {
         let choice = self.provider_choices[provider_index].clone();
         self.active_provider = provider_index;
         self.provider_name = choice.name;
-        self.profile_name = choice.profile.to_string();
+        self.profile_name = choice.profile_name.clone();
         self.provider_status = choice.status;
         self.provider_settings_count = choice.settings_count;
         self.provider_selector = None;
+        self.remember_active_account();
+        self.sync_account_selection();
         let Some(source) = source_index
             .and_then(|index| choice.sources.get(index))
             .cloned()
         else {
             self.current_source = None;
             self.source_name = "-".to_owned();
-            self.pages = vec![FolderPage::shared(Vec::new())];
+            self.pages = vec![FolderPage::shared(
+                choice
+                    .sources
+                    .iter()
+                    .map(|source| source.root.clone())
+                    .collect(),
+            )];
             self.message = self.provider_status.clone();
-            if self.provider_status != "Ready" {
-                self.active_tab = AppTab::Settings;
-                if self.settings_form.is_none() {
-                    self.settings_form = Some(SettingsForm::new(&self.network_settings));
-                }
-            }
             return ProviderActivation {
                 restored: false,
                 root_to_load: None,
@@ -934,7 +1314,14 @@ impl BrowserApp {
 
     fn download_target_breadcrumbs(&self) -> String {
         self.download_target()
-            .map(|target| format!("{} / {}", self.breadcrumbs(), target.name))
+            .map(|target| {
+                let breadcrumbs = self.breadcrumbs();
+                if breadcrumbs.is_empty() {
+                    target.name.clone()
+                } else {
+                    format!("{breadcrumbs} / {}", target.name)
+                }
+            })
             .unwrap_or_else(|| self.breadcrumbs())
     }
 
@@ -951,7 +1338,7 @@ impl BrowserApp {
                 path.push(safe_name(&folder.name, folder.reference.object_id.as_str()));
             }
         }
-        path.join(safe_name(&target.name, target.reference.object_id.as_str()))
+        target_destination(&path, target)
     }
 
     fn download_parent_destination(&self) -> PathBuf {
@@ -980,7 +1367,7 @@ impl BrowserApp {
     fn level_count_label(&self) -> String {
         let count = self.current().items.len();
         if self.current().is_shared_root() {
-            format!("{count} saved links")
+            format!("{count} sources")
         } else {
             format!("{count} direct items")
         }
@@ -995,11 +1382,11 @@ impl BrowserApp {
     }
 
     fn breadcrumbs(&self) -> String {
-        self.pages
-            .iter()
-            .map(FolderPage::name)
-            .collect::<Vec<_>>()
-            .join(" / ")
+        self.breadcrumb_components().join(" / ")
+    }
+
+    fn breadcrumb_components(&self) -> Vec<&str> {
+        self.pages.iter().skip(1).map(FolderPage::name).collect()
     }
 
     fn select_previous(&mut self) {
@@ -1048,19 +1435,6 @@ impl BrowserApp {
         }
     }
 
-    fn handle_selection_key(&mut self, code: &KeyCode) -> bool {
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
-            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
-            KeyCode::PageUp => self.page_up(),
-            KeyCode::PageDown => self.page_down(),
-            KeyCode::Home => self.select_first(),
-            KeyCode::End => self.select_last(),
-            _ => return false,
-        }
-        true
-    }
-
     fn replace_current_items(&mut self, items: Vec<RemoteItem>) {
         let selected_id = self
             .selected_item()
@@ -1095,7 +1469,7 @@ impl BrowserApp {
         let Some(target) = self.selected_download_target().cloned() else {
             return;
         };
-        self.download_form = Some(DownloadForm::new(&self.destination));
+        self.download_form = Some(DownloadForm::new());
         self.download_destination =
             Some(self.selected_target_destination(&self.destination, &target));
         self.download_target = Some(target);
@@ -1114,9 +1488,6 @@ impl BrowserApp {
         self.mode = BrowserMode::Scanning;
         self.message = self.planning_message().to_owned();
         self.download = DownloadDisplay::default();
-        self.logs.clear();
-        self.log_filter = LogFilter::All;
-        self.log_offset_from_bottom = 0;
         self.download_form = None;
     }
 
@@ -1128,115 +1499,58 @@ impl BrowserApp {
         self.download_form = None;
     }
 
-    fn refresh_form_destination(&mut self) {
-        let Some(form) = self.download_form.as_ref() else {
-            return;
-        };
-        let Some(target) = self.download_target.as_ref() else {
-            return;
-        };
-        self.download_destination =
-            Some(self.selected_target_destination(Path::new(&form.destination_root), target));
-    }
-
     fn handle_form_edit_key(&mut self, code: KeyCode) {
         let Some(form) = self.download_form.as_mut() else {
             return;
         };
-        match form.field {
-            FormField::Destination => match code {
-                KeyCode::Left => form.cursor = form.cursor.saturating_sub(1),
-                KeyCode::Right => {
-                    form.cursor = form
-                        .cursor
-                        .saturating_add(1)
-                        .min(form.destination_root.chars().count());
-                }
-                KeyCode::Home => form.cursor = 0,
-                KeyCode::End => form.cursor = form.destination_root.chars().count(),
-                KeyCode::Backspace if form.cursor > 0 => {
-                    remove_char(&mut form.destination_root, form.cursor - 1);
-                    form.cursor -= 1;
-                }
-                KeyCode::Delete if form.cursor < form.destination_root.chars().count() => {
-                    remove_char(&mut form.destination_root, form.cursor);
-                }
-                KeyCode::Char(character) => {
-                    insert_char(&mut form.destination_root, form.cursor, character);
-                    form.cursor += 1;
-                }
-                _ => {}
-            },
-            FormField::Workers => match code {
-                KeyCode::Left | KeyCode::Char('-') => {
-                    form.workers = form.workers.saturating_sub(1).max(1);
-                }
-                KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
-                    form.workers = form.workers.saturating_add(1).min(5);
-                }
-                KeyCode::Char(value @ '1'..='5') => {
-                    form.workers = value.to_digit(10).unwrap_or(1) as usize;
-                }
-                _ => {}
-            },
-        }
-        self.refresh_form_destination();
-    }
-
-    fn switch_tab(&mut self, forward: bool) {
-        self.active_tab = match (self.active_tab, forward) {
-            (AppTab::Files, true) | (AppTab::Settings, false) => AppTab::Logs,
-            (AppTab::Logs, true) | (AppTab::Files, false) => AppTab::Settings,
-            (AppTab::Settings, true) | (AppTab::Logs, false) => AppTab::Files,
-        };
-        if self.active_tab == AppTab::Settings && self.settings_form.is_none() {
-            self.settings_form = Some(SettingsForm::new(&self.network_settings));
+        match code {
+            KeyCode::Left | KeyCode::Char('-') => {
+                form.workers = form.workers.saturating_sub(1).max(1);
+            }
+            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                form.workers = form.workers.saturating_add(1).min(5);
+            }
+            KeyCode::Char(value @ '1'..='5') => {
+                form.workers = value.to_digit(10).unwrap_or(1) as usize;
+            }
+            _ => {}
         }
     }
 
-    fn focused_panel(&self) -> PanelFocus {
-        match self.active_tab {
-            AppTab::Files => self.files_focus,
-            AppTab::Logs => self.logs_focus,
-            AppTab::Settings => self.settings_focus,
-        }
+    fn move_navigation(&mut self, forward: bool) {
+        self.navigation_tab = self.navigation_tab.adjacent(if forward { 1 } else { -1 });
     }
 
-    fn switch_panel(&mut self) {
-        let focus = match self.focused_panel() {
-            PanelFocus::Upper => PanelFocus::Lower,
-            PanelFocus::Lower => PanelFocus::Upper,
-        };
-        match self.active_tab {
-            AppTab::Files => self.files_focus = focus,
-            AppTab::Logs => self.logs_focus = focus,
-            AppTab::Settings => self.settings_focus = focus,
-        }
+    fn activate_navigation(&mut self) {
+        self.active_tab = self.navigation_tab;
+        self.navigation_focus = NavigationFocus::Content;
+        self.account_detail_open = false;
     }
 
     fn handle_settings_edit_key(&mut self, code: KeyCode) {
         let Some(form) = self.settings_form.as_mut() else {
             return;
         };
+        let value_len = form.selected_value().chars().count();
         match code {
             KeyCode::Left => form.cursor = form.cursor.saturating_sub(1),
             KeyCode::Right => {
-                form.cursor = form
-                    .cursor
-                    .saturating_add(1)
-                    .min(form.proxy.chars().count());
+                form.cursor = form.cursor.saturating_add(1).min(value_len);
             }
             KeyCode::Home => form.cursor = 0,
-            KeyCode::End => form.cursor = form.proxy.chars().count(),
+            KeyCode::End => form.cursor = value_len,
             KeyCode::Backspace if form.cursor > 0 => {
-                remove_char(&mut form.proxy, form.cursor - 1);
+                let cursor = form.cursor;
+                remove_char(form.selected_value_mut(), cursor - 1);
                 form.cursor -= 1;
             }
-            KeyCode::Delete if form.cursor < form.proxy.chars().count() => {
-                remove_char(&mut form.proxy, form.cursor);
+            KeyCode::Delete if form.cursor < value_len => {
+                let cursor = form.cursor;
+                remove_char(form.selected_value_mut(), cursor);
             }
             KeyCode::Char(character) => {
-                insert_char(&mut form.proxy, form.cursor, character);
+                let cursor = form.cursor;
+                insert_char(form.selected_value_mut(), cursor, character);
                 form.cursor += 1;
             }
             _ => {}
@@ -1246,38 +1560,56 @@ impl BrowserApp {
     fn filtered_log_count(&self) -> usize {
         self.logs
             .iter()
-            .filter(|entry| self.log_filter.matches(entry.level))
+            .filter(|entry| {
+                self.log_filter.matches(entry.level)
+                    && self.log_target_filter.matches(&entry.target)
+            })
             .count()
     }
 
+    #[cfg(test)]
     fn handle_log_key(&mut self, code: &KeyCode) {
+        self.handle_log_intent(keymap::logs::intent(*code));
+    }
+
+    fn handle_log_intent(&mut self, intent: Option<keymap::logs::Intent>) {
         let max_offset = self.filtered_log_count().saturating_sub(1);
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+        match intent {
+            Some(keymap::logs::Intent::Previous) => {
                 self.log_offset_from_bottom = self
                     .log_offset_from_bottom
                     .saturating_add(1)
                     .min(max_offset);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(keymap::logs::Intent::Next) => {
                 self.log_offset_from_bottom = self.log_offset_from_bottom.saturating_sub(1);
             }
-            KeyCode::PageUp => {
+            Some(keymap::logs::Intent::PageUp) => {
                 self.log_offset_from_bottom = self
                     .log_offset_from_bottom
                     .saturating_add(self.page_step)
                     .min(max_offset);
             }
-            KeyCode::PageDown => {
+            Some(keymap::logs::Intent::PageDown) => {
                 self.log_offset_from_bottom =
                     self.log_offset_from_bottom.saturating_sub(self.page_step);
             }
-            KeyCode::Home => self.log_offset_from_bottom = max_offset,
-            KeyCode::End => self.log_offset_from_bottom = 0,
-            KeyCode::Char('a') => self.set_log_filter(LogFilter::All),
-            KeyCode::Char('i') => self.set_log_filter(LogFilter::Info),
-            KeyCode::Char('e') => self.set_log_filter(LogFilter::Error),
-            _ => {}
+            Some(keymap::logs::Intent::First) => self.log_offset_from_bottom = max_offset,
+            Some(keymap::logs::Intent::Last) => self.log_offset_from_bottom = 0,
+            Some(keymap::logs::Intent::All) => self.set_log_filter(LogFilter::All),
+            Some(keymap::logs::Intent::Info) => self.set_log_filter(LogFilter::Info),
+            Some(keymap::logs::Intent::Error) => self.set_log_filter(LogFilter::Error),
+            Some(keymap::logs::Intent::CycleTarget) => {
+                self.log_target_filter = self.log_target_filter.next();
+                self.log_offset_from_bottom = 0;
+            }
+            Some(keymap::logs::Intent::TogglePane) => {
+                self.logs_focus = match self.logs_focus {
+                    PanelFocus::Upper => PanelFocus::Lower,
+                    PanelFocus::Lower => PanelFocus::Upper,
+                };
+            }
+            None => {}
         }
     }
 
@@ -1387,6 +1719,37 @@ impl BrowserApp {
                 transfer.total = file_total;
                 transfer.bytes_per_second = bytes_per_second;
             }
+            DownloadEvent::Retrying {
+                job_id,
+                provider: _,
+                transfer_id,
+                path,
+                offset,
+                attempt,
+                max_attempts,
+                error,
+            } => {
+                self.download.job_id = Some(job_id);
+                let transfer = self
+                    .download
+                    .transfers
+                    .entry(transfer_id)
+                    .or_insert_with(|| TransferDisplay::queued(transfer_id, path.clone(), None));
+                if transfer.status.is_terminal() {
+                    return;
+                }
+                transfer.path = path;
+                transfer.status = TransferState::Running;
+                transfer.written = offset;
+                transfer.bytes_per_second = 0.0;
+                transfer.detail = Some(format!(
+                    "Stream retry {attempt}/{max_attempts} at byte {offset}: {error}"
+                ));
+                self.message = format!(
+                    "Retrying transfer {} ({attempt}/{max_attempts})",
+                    transfer_id.0
+                );
+            }
             DownloadEvent::FileSkipped {
                 job_id,
                 provider: _,
@@ -1408,6 +1771,11 @@ impl BrowserApp {
                 transfer.bytes_per_second = 0.0;
                 transfer.detail = Some(reason.clone());
                 self.download.skipped += 1;
+                *self
+                    .download
+                    .skip_reasons
+                    .entry(reason.clone())
+                    .or_default() += 1;
                 self.download.items_processed = self.download.items_processed.saturating_add(1);
                 self.download.last_issue = Some(format!("Skipped {}: {reason}", path.display()));
             }
@@ -1495,6 +1863,37 @@ impl BrowserApp {
                 self.download.fatal = Some(error);
                 self.message = "Download failed".to_owned();
             }
+            DownloadEvent::Paused {
+                job_id,
+                provider: _,
+            } => {
+                self.mode = BrowserMode::Paused;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Paused);
+                for transfer in self.download.transfers.values_mut() {
+                    if !transfer.status.is_terminal() {
+                        transfer.status = TransferState::Paused;
+                        transfer.bytes_per_second = 0.0;
+                        transfer.detail = Some("Paused by user; partial file retained".to_owned());
+                    }
+                }
+                self.message = format!("Job {} paused", job_id.0);
+            }
+            DownloadEvent::Resumed {
+                job_id,
+                provider: _,
+            } => {
+                self.mode = BrowserMode::Scanning;
+                self.download.job_id = Some(job_id);
+                self.download.state = Some(DownloadJobState::Queued);
+                for transfer in self.download.transfers.values_mut() {
+                    if transfer.status == TransferState::Paused {
+                        transfer.status = TransferState::Queued;
+                        transfer.detail = Some("Resuming from retained partial file".to_owned());
+                    }
+                }
+                self.message = format!("Job {} resumed", job_id.0);
+            }
             DownloadEvent::Cancelled {
                 job_id,
                 provider: _,
@@ -1506,10 +1905,14 @@ impl BrowserApp {
                     if !transfer.status.is_terminal() {
                         transfer.status = TransferState::Interrupted;
                         transfer.bytes_per_second = 0.0;
-                        transfer.detail = Some("cancelled".to_owned());
+                        transfer.detail = Some("Stopped by user; partial file retained".to_owned());
                     }
                 }
-                self.message = "Download cancelled".to_owned();
+                self.download.failed = self
+                    .download
+                    .status_count(TransferState::Failed)
+                    .saturating_add(self.download.status_count(TransferState::Interrupted));
+                self.message = "Download stopped by user".to_owned();
             }
         }
     }
@@ -1584,7 +1987,9 @@ impl BrowserApp {
             .count();
         display.downloaded = display.status_count(TransferState::Completed);
         display.skipped = display.status_count(TransferState::Skipped);
-        display.failed = display.status_count(TransferState::Failed);
+        display.failed = display
+            .status_count(TransferState::Failed)
+            .saturating_add(display.status_count(TransferState::Interrupted));
         display.overall_written = display
             .transfers
             .values()
@@ -1609,6 +2014,11 @@ impl BrowserApp {
             display.overall_written = summary.bytes_written.saturating_add(summary.partial_bytes);
             display.partial_bytes = summary.partial_bytes;
         }
+        self.download_target = Some(snapshot.request.target.clone());
+        self.download_destination = Some(target_destination(
+            &snapshot.request.destination,
+            &snapshot.request.target,
+        ));
         self.download = display;
         match snapshot.state {
             DownloadJobState::Queued | DownloadJobState::Scanning => {
@@ -1618,6 +2028,10 @@ impl BrowserApp {
             DownloadJobState::Running => {
                 self.mode = BrowserMode::Downloading;
                 self.message = format!("Job {} is downloading", snapshot.id.0);
+            }
+            DownloadJobState::Paused => {
+                self.mode = BrowserMode::Paused;
+                self.message = format!("Job {} is paused", snapshot.id.0);
             }
             DownloadJobState::Finished => {
                 self.mode = BrowserMode::Finished;
@@ -1637,6 +2051,10 @@ impl BrowserApp {
             }
         }
     }
+}
+
+fn target_destination(root: &Path, target: &RemoteItem) -> PathBuf {
+    root.join(safe_name(&target.name, target.reference.object_id.as_str()))
 }
 
 fn char_byte_index(value: &str, char_index: usize) -> usize {
@@ -1665,4 +2083,19 @@ fn with_cursor(value: &str, char_index: usize) -> String {
     let byte_index = char_byte_index(&displayed, char_index);
     displayed.insert(byte_index, '▏');
     displayed
+}
+
+fn validate_account_name(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    let length = value.chars().count();
+    if length == 0 {
+        return Err("Account name cannot be blank.");
+    }
+    if length > 64 {
+        return Err("Account name must be 64 characters or fewer.");
+    }
+    if value.chars().any(char::is_control) {
+        return Err("Account name cannot contain control characters.");
+    }
+    Ok(value.to_owned())
 }

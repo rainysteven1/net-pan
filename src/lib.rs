@@ -10,6 +10,7 @@ pub mod job_client;
 pub mod logger;
 pub mod model;
 pub mod notifier;
+pub mod paths;
 pub mod plan;
 pub mod provider;
 pub mod settings;

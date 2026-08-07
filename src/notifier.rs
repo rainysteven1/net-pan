@@ -63,7 +63,7 @@ impl NotificationEvent {
                 skipped,
                 bytes_written,
             } => format!(
-                "pan-tui Job {} completed on {}/{}: {} downloaded, {} skipped, {} bytes written",
+                "net-pan Job {} completed on {}/{}: {} downloaded, {} skipped, {} bytes written",
                 job_id.0,
                 provider.provider_id,
                 provider.profile_id,
@@ -78,15 +78,15 @@ impl NotificationEvent {
                 skipped,
                 failed,
             } => format!(
-                "pan-tui Job {} partially failed on {}/{}: {} downloaded, {} skipped, {} failed",
+                "net-pan Job {} partially failed on {}/{}: {} downloaded, {} skipped, {} failed",
                 job_id.0, provider.provider_id, provider.profile_id, downloaded, skipped, failed
             ),
             Self::JobFailed { job_id, provider } => format!(
-                "pan-tui Job {} failed on {}/{}",
+                "net-pan Job {} failed on {}/{}",
                 job_id.0, provider.provider_id, provider.profile_id
             ),
             Self::ReauthRequired { provider } => format!(
-                "pan-tui requires authentication for {}/{}",
+                "net-pan requires authentication for {}/{}",
                 provider.provider_id, provider.profile_id
             ),
         }

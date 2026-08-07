@@ -7,8 +7,6 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 
-use crate::state::default_state_root;
-
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +56,7 @@ pub struct SessionLogger {
 
 impl SessionLogger {
     pub fn from_home() -> Result<Self> {
-        Self::new(default_state_root()?.join("logs"), DEFAULT_MAX_LOG_BYTES)
+        Self::new(crate::paths::logs_root()?, DEFAULT_MAX_LOG_BYTES)
     }
 
     pub fn new(root: PathBuf, max_bytes: u64) -> Result<Self> {
@@ -70,7 +68,7 @@ impl SessionLogger {
         fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create log directory {}", directory.display()))?;
         restrict_directory(&directory)?;
-        let file_prefix = format!("pan-tui_{}", now.format("%H-%M-%S"));
+        let file_prefix = format!("net-pan_{}", now.format("%H-%M-%S"));
         let (writer, current_path, part) = open_log_file(&directory, &file_prefix, 0)?;
         Ok(Self {
             directory,
@@ -230,6 +228,27 @@ mod tests {
                     0o600
                 );
             }
+        }
+    }
+
+    #[test]
+    fn writes_all_runtime_targets_to_one_session_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut logger = SessionLogger::new(temporary.path().join("logs"), 4096).unwrap();
+
+        for target in [
+            "runtime", "provider", "source", "daemon", "settings", "download",
+        ] {
+            logger
+                .write(LogLevel::Info, target, format!("event target={target}"))
+                .unwrap();
+        }
+
+        let content = fs::read_to_string(logger.current_path()).unwrap();
+        for target in [
+            "runtime", "provider", "source", "daemon", "settings", "download",
+        ] {
+            assert!(content.contains(&format!(" | INFO     | {target} - event target={target}")));
         }
     }
 }

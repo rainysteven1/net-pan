@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     env,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -8,9 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use pan_tui::{
+use net_pan::{
     client::{DaemonPanClient, EmbeddedPanClient, PanClient},
-    config::{AppConfig, default_config_root},
+    config::{AppConfig, ProviderConfigStore, default_config_root},
     daemon::{DaemonClient, DaemonService},
     download::DownloadOptions,
     ipc::default_socket_path,
@@ -21,9 +20,8 @@ use pan_tui::{
     provider::{
         ProfileId, ProviderAuthStatus, ProviderContext, ProviderId, ProviderIdentity,
         ProviderLoginRequest, ProviderRegistry, ProviderRuntime, ProviderStatus, RemoteItem,
-        RemoteObjectId, RemoteRef, SourceId,
-        aliyun::AliyunProviderFactory,
-        google::{GoogleProviderConfig, GoogleProviderFactory},
+        RemoteObjectId, RemoteRef, SourceId, aliyun::AliyunProviderFactory,
+        google::GoogleProviderFactory,
     },
     state::{StateStore, default_state_db_path},
     tui::{BrowserOutcome, BrowserProvider, BrowserRuntime, run_browser},
@@ -31,9 +29,10 @@ use pan_tui::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pan-tui",
+    name = "net-pan",
     version,
-    about = "Browse cloud-drive folders in a TUI and download selected items locally"
+    about = "Browse cloud-drive folders in a TUI and download selected items locally",
+    long_about = "Browse cloud-drive folders in a TUI and download selected items locally.\n\nRun without arguments to enter interactive mode."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,14 +41,6 @@ struct Cli {
     /// Provider to open first, for example google or aliyun
     #[arg(long, global = true)]
     provider: Option<String>,
-
-    /// Service-account JSON; defaults to the environment or standard config path
-    #[arg(short, long, global = true)]
-    credentials: Option<PathBuf>,
-
-    /// JSON file containing saved cloud-drive folder links or IDs
-    #[arg(long, global = true)]
-    sources: Option<PathBuf>,
 
     /// List saved folder links, then exit without the TUI or downloads
     #[arg(long, global = true)]
@@ -90,7 +81,8 @@ enum Command {
     /// List Sources exposed by a Provider as JSON
     Sources {
         provider: String,
-        #[arg(long, default_value = "default")]
+        /// Stable Account ProfileId shown by `net-pan providers`
+        #[arg(long)]
         profile: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -100,7 +92,8 @@ enum Command {
         provider: String,
         source: String,
         object: String,
-        #[arg(long, default_value = "default")]
+        /// Stable Account ProfileId shown by `net-pan providers`
+        #[arg(long)]
         profile: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -110,7 +103,8 @@ enum Command {
         provider: String,
         source: String,
         object: String,
-        #[arg(long, default_value = "default")]
+        /// Stable Account ProfileId shown by `net-pan providers`
+        #[arg(long)]
         profile: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -121,7 +115,8 @@ enum Command {
         source: String,
         object: String,
         destination: PathBuf,
-        #[arg(long, default_value = "default")]
+        /// Stable Account ProfileId shown by `net-pan providers`
+        #[arg(long)]
         profile: String,
         #[arg(long, default_value_t = 2)]
         workers: usize,
@@ -150,6 +145,18 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Pause an active daemon Job and retain partial files
+    Pause {
+        job_id: u64,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Resume a paused daemon Job with the same Job ID
+    Resume {
+        job_id: u64,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Submit a serialized DownloadJobRequest to the daemon
     Submit {
         request: PathBuf,
@@ -160,8 +167,6 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Run the interactive TUI
-    Tui,
     /// Manage Provider authentication independently from the TUI
     Auth {
         #[command(subcommand)]
@@ -172,18 +177,22 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     /// Start a Provider-owned interactive login flow
-    Login { provider: String },
+    Login { provider: String, profile: String },
     /// Show authentication state without exposing credentials
-    Status { provider: Option<String> },
+    Status {
+        provider: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Remove local Provider authentication state
-    Revoke { provider: String },
+    Revoke { provider: String, profile: String },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
-        Some(Command::Daemon { socket }) => return run_daemon(&cli, socket.clone()).await,
+        Some(Command::Daemon { socket }) => return run_daemon(socket.clone()).await,
         Some(Command::Status { socket }) => {
             let result = DaemonClient::local(socket.clone())?.status().await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -245,7 +254,7 @@ async fn main() -> Result<()> {
             let item = daemon
                 .refresh_item(remote_ref(provider, profile, source, object)?)
                 .await?;
-            let request = pan_tui::job::DownloadJobRequest::new(
+            let request = net_pan::job::DownloadJobRequest::new(
                 item,
                 destination.clone(),
                 DownloadOptions {
@@ -265,7 +274,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::Job { job_id, socket }) => {
             let result = DaemonClient::local(socket.clone())?.status().await?;
-            let pan_tui::ipc::IpcResult::Status { jobs, .. } = result else {
+            let net_pan::ipc::IpcResult::Status { jobs, .. } = result else {
                 unreachable!("DaemonClient::status validates the response variant");
             };
             let job = jobs
@@ -289,7 +298,21 @@ async fn main() -> Result<()> {
         }
         Some(Command::Cancel { job_id, socket }) => {
             let result = DaemonClient::local(socket.clone())?
-                .cancel(pan_tui::download::JobId(*job_id))
+                .cancel(net_pan::download::JobId(*job_id))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        Some(Command::Pause { job_id, socket }) => {
+            let result = DaemonClient::local(socket.clone())?
+                .pause(net_pan::download::JobId(*job_id))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        Some(Command::Resume { job_id, socket }) => {
+            let result = DaemonClient::local(socket.clone())?
+                .resume(net_pan::download::JobId(*job_id))
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
@@ -311,34 +334,34 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
-        Some(Command::Auth { command }) => return run_auth(&cli, command).await,
-        Some(Command::Tui) | None => {}
+        Some(Command::Auth { command }) => return run_auth(command).await,
+        None => {}
     }
     run_tui(cli).await
 }
 
-async fn run_auth(cli: &Cli, command: &AuthCommand) -> Result<()> {
+async fn run_auth(command: &AuthCommand) -> Result<()> {
     let config_root = default_config_root()?;
-    let app_config = AppConfig::load(&config_root.join("config.toml"))?;
+    let app_config = AppConfig::load(&config_root.join("settings.toml"))?;
     let context = ProviderContext {
         config_root,
         network: app_config.network,
-        config_overrides: google_runtime_overrides(cli)?,
     };
     let registry = provider_registry()?;
     match command {
-        AuthCommand::Login { provider } => {
+        AuthCommand::Login { provider, profile } => {
             let id = ProviderId::new(provider.trim())?;
+            let identity = provider_identity(provider, profile)?;
             let factory = registry
                 .get(&id)
                 .with_context(|| format!("provider {id} is not registered"))?;
             let auth = factory
-                .login(&context, ProviderLoginRequest::Interactive)
+                .login(&context, &identity, ProviderLoginRequest::Interactive)
                 .await?;
             if !auth.authenticated {
                 bail!("provider {id} did not complete authentication");
             }
-            let instance = factory.create(context.clone()).await?;
+            let instance = factory.create(context.clone(), identity).await?;
             let sources = instance.sources().await?;
             println!(
                 "{} authentication is ready; {} source(s) available",
@@ -346,25 +369,45 @@ async fn run_auth(cli: &Cli, command: &AuthCommand) -> Result<()> {
                 sources.len()
             );
         }
-        AuthCommand::Status { provider } => {
+        AuthCommand::Status { provider, profile } => {
             let selected = provider
                 .as_deref()
                 .map(|value| ProviderId::new(value.trim()))
                 .transpose()?;
+            let selected_profile = profile
+                .as_deref()
+                .map(|value| ProfileId::new(value.trim()))
+                .transpose()?;
+            let store = ProviderConfigStore::new(context.config_root.clone());
             for (id, factory) in registry.iter() {
                 if selected.as_ref().is_some_and(|selected| selected != id) {
                     continue;
                 }
-                let status = factory.auth_status(&context)?;
-                println!("{}\t{}", id, auth_status_label(status));
+                for profile_id in store.list_profiles(id)? {
+                    if selected_profile
+                        .as_ref()
+                        .is_some_and(|selected| selected != &profile_id)
+                    {
+                        continue;
+                    }
+                    let identity = ProviderIdentity::new(id.clone(), profile_id);
+                    let status = factory.auth_status(&context, &identity)?;
+                    println!(
+                        "{}\t{}\t{}",
+                        id,
+                        identity.profile_id,
+                        auth_status_label(status)
+                    );
+                }
             }
         }
-        AuthCommand::Revoke { provider } => {
+        AuthCommand::Revoke { provider, profile } => {
             let id = ProviderId::new(provider.trim())?;
+            let identity = provider_identity(provider, profile)?;
             let factory = registry
                 .get(&id)
                 .with_context(|| format!("provider {id} is not registered"))?;
-            factory.revoke(&context).await?;
+            factory.revoke(&context, &identity).await?;
             println!(
                 "{} local authentication state removed",
                 factory.display_name()
@@ -385,14 +428,20 @@ fn auth_status_label(status: ProviderAuthStatus) -> &'static str {
 }
 
 async fn run_tui(cli: Cli) -> Result<()> {
+    let _tui_instance = if cli.list {
+        None
+    } else {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("interactive TUI requires a terminal; use --list for non-interactive access");
+        }
+        Some(net_pan::tui::TuiInstanceGuard::acquire_default()?)
+    };
     let config_root = default_config_root()?;
-    let settings_path = config_root.join("config.toml");
+    let settings_path = config_root.join("settings.toml");
     let app_config = AppConfig::load(&settings_path)?;
-    let config_overrides = google_runtime_overrides(&cli)?;
     let context = ProviderContext {
         config_root,
         network: app_config.network.clone(),
-        config_overrides,
     };
     let registry = provider_registry()?;
     let daemon = DaemonClient::local(None)?;
@@ -400,7 +449,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         daemon
             .status()
             .await
-            .context("pan-tui daemon socket exists but is not usable")?;
+            .context("net-pan daemon socket exists but is not usable")?;
         Arc::new(DaemonPanClient::new(daemon).await?)
     } else {
         let provider_runtime = ProviderRuntime::from_registry(&registry, context).await;
@@ -442,9 +491,6 @@ async fn run_tui(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("interactive TUI requires a terminal; use --list for non-interactive access");
-    }
     match run_browser(
         providers,
         active_provider,
@@ -466,9 +512,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
     }
 }
 
-async fn run_daemon(cli: &Cli, socket: Option<PathBuf>) -> Result<()> {
+async fn run_daemon(socket: Option<PathBuf>) -> Result<()> {
     let config_root = default_config_root()?;
-    let app_config = AppConfig::load(&config_root.join("config.toml"))?;
+    let app_config = AppConfig::load(&config_root.join("settings.toml"))?;
     let notifier_config = NotifierConfigFile::load(&config_root.join("notifiers.toml"))?;
     let mut notifier_registry = NotifierRegistry::default();
     notifier_registry.register(DingTalkNotifierFactory)?;
@@ -482,7 +528,6 @@ async fn run_daemon(cli: &Cli, socket: Option<PathBuf>) -> Result<()> {
     let context = ProviderContext {
         config_root,
         network: app_config.network.clone(),
-        config_overrides: google_runtime_overrides(cli)?,
     };
     let registry = provider_registry()?;
     let providers = ProviderRuntime::from_registry(&registry, context).await;
@@ -500,7 +545,7 @@ async fn run_daemon(cli: &Cli, socket: Option<PathBuf>) -> Result<()> {
             service.recovered_jobs()
         );
     }
-    eprintln!("pan-tui daemon listening on {}", service.socket().display());
+    eprintln!("net-pan daemon listening on {}", service.socket().display());
     service
         .run(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -537,36 +582,17 @@ fn provider_registry() -> Result<ProviderRegistry> {
     Ok(registry)
 }
 
-fn google_runtime_overrides(cli: &Cli) -> Result<BTreeMap<ProviderId, Vec<u8>>> {
-    let credentials_requested =
-        cli.credentials.is_some() || env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_some();
-    let sources_requested = cli.sources.is_some() || env::var_os("PAN_TUI_SOURCES").is_some();
-    if !credentials_requested && !sources_requested {
-        return Ok(BTreeMap::new());
-    }
-    let config = GoogleProviderConfig {
-        enabled: true,
-        auth_mode: pan_tui::provider::google::GoogleAuthMode::ServiceAccount,
-        credentials_file: resolve_credentials(cli.credentials.clone())?,
-        token_file: PathBuf::from("google/oauth-token.json"),
-        sources_file: Some(resolve_sources(cli.sources.clone())?),
-        sources: Vec::new(),
-        proxy: None,
-    };
-    let contents =
-        toml::to_string_pretty(&config).context("failed to build Google CLI override")?;
-    Ok(BTreeMap::from([(
-        ProviderId::new("google").expect("static provider id is valid"),
-        contents.into_bytes(),
-    )]))
-}
-
 fn select_provider(providers: &[BrowserProvider], requested: Option<&str>) -> Result<usize> {
     if let Some(requested) = requested {
         let requested = ProviderId::new(requested.trim())?;
         if let Some(index) = providers
             .iter()
-            .position(|provider| provider.id() == &requested)
+            .position(|provider| provider.id() == &requested && provider.is_ready())
+            .or_else(|| {
+                providers
+                    .iter()
+                    .position(|provider| provider.id() == &requested)
+            })
         {
             return Ok(index);
         }
@@ -588,7 +614,7 @@ fn provider_status_message(name: &str, status: &ProviderStatus) -> String {
     match status {
         ProviderStatus::Disabled => format!("{name} is disabled"),
         ProviderStatus::NeedsConfig => {
-            format!("{name} needs configuration in ~/.config/pan-tui/providers")
+            format!("{name} needs configuration in ~/.net-pan/providers")
         }
         ProviderStatus::Connecting => format!("{name} is still connecting"),
         ProviderStatus::Ready => format!("{name} did not expose an instance"),
@@ -608,40 +634,6 @@ fn resolve_destination(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("failed to resolve current directory for default destination")?
         .join("downloads"))
-}
-
-fn resolve_credentials(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let path = explicit
-        .or_else(|| env::var_os("GOOGLE_APPLICATION_CREDENTIALS").map(PathBuf::from))
-        .or_else(|| {
-            env::var_os("HOME").map(|home| google_private_file(&PathBuf::from(home), "service-account.json"))
-        })
-        .context("service-account credentials not found; use --credentials or GOOGLE_APPLICATION_CREDENTIALS")?;
-    if !path.is_file() {
-        bail!(
-            "service-account credentials do not exist: {}",
-            path.display()
-        );
-    }
-    Ok(path)
-}
-
-fn resolve_sources(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let path = explicit
-        .or_else(|| env::var_os("PAN_TUI_SOURCES").map(PathBuf::from))
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(|home| google_private_file(&PathBuf::from(home), "sources.json"))
-        })
-        .context("sources file not found; use --sources or PAN_TUI_SOURCES")?;
-    if !path.is_file() {
-        bail!("sources file does not exist: {}", path.display());
-    }
-    Ok(path)
-}
-
-fn google_private_file(home: &std::path::Path, file: &str) -> PathBuf {
-    home.join(".config/pan-tui/providers/google").join(file)
 }
 
 fn print_shared_items(items: &[RemoteItem]) {
@@ -669,19 +661,31 @@ fn print_shared_items(items: &[RemoteItem]) {
 
 #[cfg(test)]
 mod tests {
-    use super::google_private_file;
-    use std::path::Path;
+    use clap::{CommandFactory, Parser};
+
+    use super::*;
 
     #[test]
-    fn google_cli_defaults_use_provider_private_paths() {
-        let home = Path::new("/tmp/pan-tui-home");
-        assert_eq!(
-            google_private_file(home, "service-account.json"),
-            Path::new("/tmp/pan-tui-home/.config/pan-tui/providers/google/service-account.json")
+    fn no_arguments_selects_interactive_mode() {
+        let cli = Cli::try_parse_from(["net-pan"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn tui_is_not_an_exposed_subcommand() {
+        assert!(Cli::try_parse_from(["net-pan", "tui"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("tui"))
         );
-        assert_eq!(
-            google_private_file(home, "sources.json"),
-            Path::new("/tmp/pan-tui-home/.config/pan-tui/providers/google/sources.json")
-        );
+        assert!(help.contains("Run without arguments to enter interactive mode."));
+    }
+
+    #[test]
+    fn daemon_and_script_commands_remain_subcommands() {
+        let cli = Cli::try_parse_from(["net-pan", "status"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
     }
 }

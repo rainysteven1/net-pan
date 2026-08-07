@@ -24,12 +24,12 @@
 - Basis: v3 configuration boundary and Phase 15 implementation.
 - Reason: global configuration stays provider-neutral, while file permissions, atomic creation, and path isolation remain consistently enforced by shared code.
 
-## 2026-08-05: Explicit legacy Google migration
+## 2026-08-06: Current-only Account Profile layout
 
-- Decision: legacy `service-account.json` and `sources.json` remain readable until the user or settings flow explicitly creates `providers/google.toml`.
-- Basis: Phase 15 migration requirements.
-- Reason: automatic file moves would be destructive and make rollback unclear; an idempotent generated config can reference the existing files without modifying them.
-- Compatibility: discovery also checks the pre-rename `~/.config/gdrive-juicefs` directory before reporting that Google needs configuration.
+- Decision: runtime configuration is loaded only from `~/.net-pan/providers/<provider>/<profile>/config.toml`.
+- Decision: `ProfileId` is generated as `p_` plus eight safe ASCII characters and is independent from the editable Account name.
+- Basis: Phase 34 multi-Account design and the project being pre-release.
+- Reason: one stable `ProviderIdentity` must own its credentials, tokens, Sources, settings, and Jobs without legacy fallback paths or name-derived storage.
 
 ## 2026-08-05: Download opening receives remote metadata
 
@@ -82,9 +82,9 @@
 ## 2026-08-05: Aliyun enterprise native mode and personal bridge
 
 - Decision: direct Aliyun OpenAPI login requires an already approved enterprise application and remains a native Provider mode.
-- Decision: personal users use a separately identified AList/OpenList Bridge Provider; `pan-tui` will not call AList's hosted OAuth token endpoint or present AList-issued credentials as its own.
+- Decision: personal users use a separately identified AList/OpenList Bridge Provider; `net-pan` will not call AList's hosted OAuth token endpoint or present AList-issued credentials as its own.
 - Basis: Aliyun Drive stopped accepting new personal developer applications on 2025-07-01, and AList source shows that users without a client ID send refresh tokens to AList's hosted broker.
-- Reason: direct reuse would add third-party credential custody, shared quota, availability, and application-policy dependencies. A bridge keeps that trust decision explicit and leaves Aliyun tokens outside `pan-tui`.
+- Reason: direct reuse would add third-party credential custody, shared quota, availability, and application-policy dependencies. A bridge keeps that trust decision explicit and leaves Aliyun tokens outside `net-pan`.
 
 ## 2026-08-05: SQLite before daemon and notifications
 
@@ -113,7 +113,13 @@
 ## 2026-08-05: PanClient is the TUI and CLI application boundary
 
 - Decision: TUI and script-oriented CLI commands depend only on `PanClient`; they never hold `CloudProvider`, `ProviderFactory`, `DownloadManager`, or `JobBackend`.
-- Decision: `DaemonPanClient` forwards provider browsing, settings, jobs, cancellation, and subscriptions over IPC v3. `EmbeddedPanClient` implements the same contract with an in-process `ProviderRuntime` and `DownloadManager`.
+- Decision: `DaemonPanClient` forwards Account/provider browsing, settings, jobs, pause/resume, cancellation, and subscriptions over IPC v5. `EmbeddedPanClient` implements the same contract with an in-process `ProviderRuntime` and `DownloadManager`.
 - Decision: in resident mode the daemon is the only owner of Provider instances and Provider runtime state. Saving settings rebuilds only the selected daemon-owned Provider, and a failed rebuild retains the previous instance.
 - Reason: a TUI-owned Provider alongside a daemon-owned download runtime creates two divergent connection/configuration states. One client contract keeps TUI, CLI, embedded use, and resident use behaviorally aligned while leaving purely visual state local to Ratatui.
 - Wire boundary: IPC uses serializable provider-neutral catalog, settings, `RemoteRef`, `RemoteItem`, `RemoteSource`, and Job DTOs. Credentials, trait objects, signed URLs, webhook secrets, and raw Provider responses never cross the socket.
+
+## 2026-08-06: Provider Type, Account, and Source navigation
+
+- Decision: the header switches Provider Type with `[` / `]`; the left Navigation contains Accounts, Files, Transfers, Logs, and Settings; `Tab` switches Navigation/Content focus and `s` opens global Settings.
+- Decision: each Provider Type remembers its last active Account, while Source browser sessions remain keyed by `ProviderIdentity + SourceId`.
+- Reason: Provider Type, authenticated Account, and browse entry are separate identities. Existing Jobs retain the identity captured at submission when the user switches views.
