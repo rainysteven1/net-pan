@@ -8,7 +8,7 @@ the version in `Cargo.toml`.
 1. Ensure the worktree is clean.
 2. Update `Cargo.toml` and `CHANGELOG.md`.
 3. Run `just release-check <version>`.
-4. Review `git log --format='%an <%ae>'` for personal author metadata.
+4. Review `git log --format='%an <%ae>'` and accept that historical author addresses are public.
 5. Create and push the tag manually after review.
 
 The release helper deliberately does not commit, tag, push, or publish.
@@ -45,6 +45,7 @@ commits or pushes the tap.
 ## Privacy gate
 
 `./scripts/privacy-check.sh --history` blocks release when repository files contain credential
-material, private infrastructure identifiers, personal home paths, consumer email addresses, or
-when Git commit author/committer addresses use personal email domains. Rewrite or replace that
-metadata before publishing; never bypass the release privacy gate.
+material, private infrastructure identifiers, personal home paths, or consumer email addresses.
+Historical Git author/committer addresses are commit metadata rather than credentials, so personal
+domains produce a warning without blocking release. Use a GitHub noreply address for new commits
+when possible, and never bypass failures for actual sensitive content.

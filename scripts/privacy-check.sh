@@ -76,8 +76,7 @@ fi
 if [[ "$CHECK_HISTORY" -eq 1 ]]; then
   personal_domains='@(gmail|qq|163|126|outlook|hotmail)\.[A-Za-z]{2,}$'
   if git log --format='%ae%n%ce' | rg --quiet --ignore-case --pcre2 "$personal_domains"; then
-    echo "[privacy] Git history contains a personal author or committer email domain" >&2
-    failed=1
+    echo "[privacy] warning: Git history contains a public personal email address" >&2
   fi
 fi
 

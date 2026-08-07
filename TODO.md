@@ -497,10 +497,10 @@ Gate：用户无需阅读说明即可区分应用级与账号级设置；切换 
 - [x] P36.5 归档使用精确文件 allowlist，拒绝额外文件和符号链接；匹配架构时同时验证归档二进制和用户级 `install.sh` 安装结果。
 - [x] P36.6 根据最终三份归档生成 Linux/macOS Homebrew formula；支持输出到本地或外部 tap，但不自动 commit、tag、push 或 upload。
 - [x] P36.7 仓库内容隐私门禁通过；发布物只允许 binary、installer、README、LICENSE 和 THIRD_PARTY_NOTICES，不包含 `~/.net-pan`、数据库、日志或凭据。
-- [~] P36.8 Git 历史仍含个人邮箱域名，`privacy-check.sh --history` 会按设计阻止 Release；需在首次公开发布前由维护者明确决定是否改写历史。
+- [x] P36.8 维护者确认保留现有 Git 作者邮箱历史；`privacy-check.sh --history` 对个人邮箱给出 warning，新提交使用 GitHub noreply，真实敏感内容仍阻止 Release。
 - [x] P36.9 完成 Bash/YAML/Just 解析、128 个测试、Clippy `-D warnings`、release build、Linux 归档、checksum、`--version` 与安装 smoke test。
 
-Gate：本地内容检查、完整 Rust 检查和归档验收均通过；真实 tag Release 只有在历史作者信息门禁通过后才允许执行。**当前被 P36.8 阻塞。**
+Gate：本地内容检查、完整 Rust 检查和归档验收均通过；真实 tag Release 可在 clean worktree 上执行最终 release-check 后创建。
 
 ## Phase 37：TUI 单实例与终端生命周期
 
