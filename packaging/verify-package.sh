@@ -42,6 +42,7 @@ cat > "$expected" <<EOF
 $package_name/
 $package_name/LICENSE
 $package_name/README.md
+$package_name/README_zh.md
 $package_name/THIRD_PARTY_NOTICES
 $package_name/install.sh
 $package_name/net-pan

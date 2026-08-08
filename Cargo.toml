@@ -1,6 +1,6 @@
 [package]
 name = "net-pan"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Provider-neutral TUI and daemon for downloading cloud-drive files"

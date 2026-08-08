@@ -62,6 +62,7 @@ mkdir -p "$package_dir" "$DIST_DIR"
 install -m 0755 "$binary" "$package_dir/net-pan"
 install -m 0755 packaging/install.sh "$package_dir/install.sh"
 install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES "$package_dir/"
+install -m 0644 docs/README_zh.md "$package_dir/README_zh.md"
 tar -C "$DIST_DIR" -czf "$archive" "$package_name"
 ./packaging/verify-package.sh "$archive"
 

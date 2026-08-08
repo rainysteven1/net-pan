@@ -62,6 +62,10 @@ if [[ "$RUN_FMT" -eq 1 ]]; then
   ./scripts/format.sh --check
 fi
 if [[ "$RUN_CHECK" -eq 1 ]]; then
+  step "Checking POSIX installer syntax"
+  sh -n packaging/install-release.sh
+fi
+if [[ "$RUN_CHECK" -eq 1 ]]; then
   step "Checking all Rust targets"
   cargo check --locked --all-targets
 fi

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-08
+
+### Added
+
+- Add a concise Simplified Chinese guide under `docs/README_zh.md`.
+
+### Changed
+
+- Replace internal planning documents with focused public user documentation.
+- Include both English and Chinese guides in release archives and Homebrew installs.
+
+### Fixed
+
+- Make the checksum-verifying release installer compatible with POSIX `sh`.
+- Retry transient GitHub TLS and connection failures during installation.
+
+## [0.1.0] - 2026-08-08
+
 ### Added
 
 - Provider-neutral Google Drive and Aliyun Drive browsing and downloads.

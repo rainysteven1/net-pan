@@ -20,6 +20,7 @@ GitHub Actions builds Linux x86_64 plus macOS x86_64 and arm64 archives. Every a
 - `net-pan`
 - `install.sh`
 - `README.md`
+- `README_zh.md`
 - `LICENSE`
 - `THIRD_PARTY_NOTICES`
 
@@ -36,10 +37,10 @@ derived from the exact uploaded bytes. To generate the same formula locally afte
 archives in `dist/`, run:
 
 ```bash
-just homebrew-formula v0.1.0
+just homebrew-formula v0.1.1
 ```
 
-Use `just homebrew-tap v0.1.0 ../homebrew-tools` to write it into a tap repository. Neither command
+Use `just homebrew-tap v0.1.1 ../homebrew-tools` to write it into a tap repository. Neither command
 commits or pushes the tap.
 
 ## Privacy gate

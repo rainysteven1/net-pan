@@ -4,536 +4,189 @@
 [![Release](https://img.shields.io/github/v/release/rainysteven1/net-pan)](https://github.com/rainysteven1/net-pan/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`net-pan` is a Rust terminal downloader for cloud-drive folders. The goal is a small TUI that lets
-you open saved netdisk sources, browse one level at a time, and download the highlighted item to a
-local directory.
+English | [简体中文](docs/README_zh.md)
 
-Provider scope:
+`net-pan` is a provider-neutral terminal application for browsing cloud drives and downloading
+files or folders to local storage. It provides an interactive TUI, scriptable CLI, persistent jobs,
+an optional daemon, resumable downloads, and completion notifications.
 
-- Google Drive: implemented
-- Aliyun Drive: OAuth refresh, user/drive information, sources, file listing/metadata, and downloads implemented
+## Providers
 
-The app is no longer tied to a JuiceFS mount. The default destination is `~/Downloads`; pass
-`--destination <PATH>` to download somewhere else.
+| Provider | Status |
+| --- | --- |
+| Google Drive | Browsing, metadata, download, resume, Installed App OAuth, service accounts |
+| Aliyun Drive | OAuth refresh, drive information, browsing, metadata, download, resume |
 
-## Features
+Aliyun is mock-tested; real-account acceptance is still in progress. Google-native Docs, Sheets,
+and Slides are currently skipped because export formats are not implemented.
 
-- Saved source registry; no link is required on the command line
-- `Sources` virtual entry level with a visible source count
-- Level-by-level Ratatui browser with middle-collapsed breadcrumbs
-- Download of the highlighted folder or regular file, preserving the saved-root hierarchy
-- Streaming writes through same-directory `.part` files
-- HTTP Range resume, size validation, `sync_all`, and atomic final rename
-- Multi-row transfer progress with per-file and aggregate speeds
-- Overall item-count percentage independent of file sizes
-- One validated global download root plus a read-only target preview and 1-5 concurrent file workers
-- Loguru-style session logs with date directories and size rotation
-- Left-side `Accounts / Files / Transfers / Logs / Settings` navigation
-- Top-shell destination and a cc-switch-style contextual shortcut bar
-- Header Provider Type switching, custom Account names, and independent browser sessions per Source
-- Schema-driven Provider settings with masked secrets and isolated instance rebuilds
-- Safe local names and deterministic handling of duplicate remote names
-- Per-file error handling: one failed file does not stop the remaining plan
-- In-app proxy settings with live reconnect; system proxy variables are ignored
-- Versioned SQLite Job/Transfer history with WAL, batched progress, and interrupted-job recovery
-- Optional Unix-socket daemon with TUI attachment, snapshot subscription, and idempotent submission
-- DingTalk and Feishu notifier registry with signed webhooks and a durable SQLite outbox
+## Install
 
-## Requirements
+Install the latest Linux or macOS release with checksum verification:
 
-- A recent stable Rust toolchain
-- For Google Drive: a Google Cloud project with the Google Drive API enabled
-- For Google Drive: an Installed App OAuth client JSON or a service-account JSON key
-- Access to the configured source folders for the selected Google account
-- A sources JSON file containing one or more saved Google Drive folder links or IDs
-- For Aliyun Drive: an OpenAPI application client ID and refresh token
+```sh
+curl -fsSL https://github.com/rainysteven1/net-pan/releases/latest/download/install.sh | sh
+```
 
-## Google Drive Setup
+The binary is installed to `~/.local/bin/net-pan`. Override the destination when needed:
 
-Every Provider Account has a generated stable ID such as `p_zr6bktv5`. The user-facing Account
-name is editable and does not affect paths or existing Jobs. Account files are isolated under:
+```sh
+curl -fsSL https://github.com/rainysteven1/net-pan/releases/latest/download/install.sh \
+  | NET_PAN_INSTALL_DIR="$HOME/bin" sh
+```
+
+Supported release targets:
+
+- Linux x86_64
+- macOS x86_64
+- macOS arm64
+
+Release archives, SHA-256 checksums, and a Homebrew formula are available on the
+[Releases](https://github.com/rainysteven1/net-pan/releases) page.
+
+## Quick Start
+
+Launch the TUI:
+
+```sh
+net-pan
+```
+
+The first run creates `~/.net-pan` and draft accounts for the built-in providers. Use `Accounts`
+to create or activate an account, `Settings` to configure it, and `Files` to browse its sources.
+Press `g` for application-wide download and proxy settings.
+
+The global download directory defaults to `~/Downloads`. It must be an existing absolute directory
+and cannot be a symbolic link. Existing completed files are skipped by default; `.part` files are
+resumed with HTTP Range when the provider supports it.
+
+## Google Setup
+
+Each account has a stable profile directory:
 
 ```text
 ~/.net-pan/providers/google/<PROFILE_ID>/
 ```
 
-Start the TUI, open `Accounts`, and press `n` to create another Google Account. The initial run also
-creates one disabled draft Account for each built-in Provider.
+For Installed App OAuth:
 
-### Installed App OAuth
+1. Enable Google Drive API and create a Desktop OAuth client.
+2. Place the downloaded client JSON at `oauth-client.json` in the profile directory.
+3. Add one or more Drive folder IDs or links to `sources.json`.
+4. Configure the account in the TUI, then run:
 
-1. Enable the Google Drive API in a Google Cloud project.
-2. Create an OAuth client with application type `Desktop app`, download its JSON, and install it
-   privately:
-
-   ```bash
-   install -d -m 700 ~/.net-pan/providers/google/PROFILE_ID
-   install -m 600 /path/to/client_secret.json \
-     ~/.net-pan/providers/google/PROFILE_ID/oauth-client.json
-   ```
-
-3. Configure `~/.net-pan/providers/google/PROFILE_ID/config.toml`:
-
-   ```toml
-   name = "Personal Google"
-   enabled = true
-   auth_mode = "installed_app"
-   credentials_file = "oauth-client.json"
-   token_file = "token.json"
-   sources_file = "sources.json"
-   ```
-
-4. Create the sources file as shown below, then complete the first login:
-
-   ```bash
-   net-pan auth login google PROFILE_ID
-   net-pan auth status google --profile PROFILE_ID
-   ```
-
-The login command prints Google's authorization URL and listens on a temporary
-`127.0.0.1` callback port for up to five minutes. It uses Authorization Code + PKCE and persists
-the access/refresh token state atomically with mode `0600`. Refresh-token rotation is saved before
-the refreshed access token is returned to callers. Use
-`net-pan auth revoke google PROFILE_ID` to remove that Account's local token state.
-
-### Service Account
-
-1. Enable the Google Drive API in the service account's Google Cloud project.
-2. Create and download a JSON key for the service account.
-3. In Google Drive, share the source folder with the JSON file's `client_email` as a viewer.
-4. Store the key outside this repository and restrict its permissions:
-
-   ```bash
-   install -d -m 700 ~/.net-pan/providers/google/PROFILE_ID
-   install -m 600 /path/to/downloaded-key.json \
-     ~/.net-pan/providers/google/PROFILE_ID/service-account.json
-   ```
-
-5. Save the shared folder links in `~/.net-pan/providers/google/PROFILE_ID/sources.json`:
-
-   ```json
-   {
-     "sources": [
-       "https://drive.google.com/drive/folders/FOLDER_ID",
-       "ANOTHER_FOLDER_ID"
-     ]
-   }
-   ```
-
-   ```bash
-   chmod 600 ~/.net-pan/providers/google/PROFILE_ID/sources.json
-   ```
-
-6. Create `~/.net-pan/providers/google/PROFILE_ID/config.toml` with mode `0600`:
-
-   ```toml
-   name = "Work Google"
-   enabled = true
-   auth_mode = "service_account"
-   credentials_file = "service-account.json"
-   token_file = "token.json"
-   sources_file = "sources.json"
-   ```
-
-Google configuration is loaded only from the selected Account directory. Relative credential,
-token, and sources paths are resolved inside that directory.
-
-Duplicate folder IDs are collapsed. Each saved source is validated at startup and must currently be
-a Google Drive folder that the service account can read.
-
-Do not commit the JSON key. Access tokens and private-key material are never written to logs or to
-the download destination.
-
-## Aliyun Drive Setup
-
-Create an Aliyun Account in the TUI, then edit
-`~/.net-pan/providers/aliyun/PROFILE_ID/config.toml` with mode `0600`:
-
-```toml
-name = "Personal Aliyun"
-enabled = true
-client_id = "YOUR_OPENAPI_CLIENT_ID"
-refresh_token = "YOUR_INITIAL_REFRESH_TOKEN"
-drive = "default"
-root_file_id = "root"
-
-[[sources]]
-id = "main"
-name = "Aliyun Drive"
-drive = "default"
-root_file_id = "root"
+```sh
+net-pan auth login google <PROFILE_ID>
+net-pan auth status google --profile <PROFILE_ID>
 ```
 
-The provider uses the personal-drive OpenAPI at `https://openapi.alipan.com`. Rotated access and
-refresh tokens are atomically persisted to the same Account directory as `token.json` with
-mode `0600`. Signed download URLs and token response bodies are not written to logs.
+Service-account authentication is also supported. Store its JSON key with mode `0600`, share each
+source folder with the service-account email, and select the service-account mode in Provider
+Settings. Credentials, refresh tokens, and signed download URLs are never written to logs.
 
-Folder creation, upload, delete, and asynchronous task operations are part of the common Provider
-capability surface but are not implemented by the current Aliyun adapter.
+Example `sources.json`:
 
-## Build and Run
-
-Install the latest Linux or macOS release. The installer downloads the matching archive and refuses
-to install it unless SHA-256 verification succeeds:
-
-```bash
-curl -fsSL https://github.com/rainysteven1/net-pan/releases/latest/download/install.sh | bash
+```json
+{
+  "sources": [
+    "https://drive.google.com/drive/folders/FOLDER_ID",
+    "ANOTHER_FOLDER_ID"
+  ]
+}
 ```
 
-The default install directory is `~/.local/bin`. Override it with `NET_PAN_INSTALL_DIR`.
+## TUI Keys
 
-Release assets also include `net-pan.rb`, generated from the checksums of the exact Linux x86_64
-and macOS x86_64/arm64 archives. A tap maintainer can publish it without rebuilding binaries.
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Move in the current list |
+| `Enter` / `Right` | Open the selected route or folder |
+| `Backspace` | Return to the parent breadcrumb |
+| `Left` | Focus navigation |
+| `[` / `]` | Switch provider type |
+| `d` | Download the selected file or folder |
+| `o` | Open the source selector |
+| `r` | Reload the current source or folder |
+| `l` | Open runtime logs |
+| `g` | Open global settings |
+| `Space` | Pause or resume the active job |
+| `x` | Stop the active job |
+| `q` / `Ctrl-C` | Confirm exit |
 
-Build a release binary:
+Logs support `a/i/e` level filters, `f` target filters, and `Tab` between list and detail. Provider,
+source, daemon, settings, and download events share one chronological session log.
 
-```bash
-cargo build --release
-```
-
-Project engineering commands are exposed through `just`:
-
-```bash
-just check --full
-just package
-just verify-package dist/net-pan-v0.1.0-linux-x86_64.tar.gz
-just homebrew-formula v0.1.0
-```
-
-Start the interactive browser with the default destination:
-
-```bash
-net-pan
-```
-
-Only one interactive TUI may run for the current user. A second invocation exits with the PID of
-the existing TUI. Closing its terminal or sending SIGHUP/SIGTERM restores the terminal and releases
-the instance lock. This restriction does not apply to `--list`, script CLI commands, or the daemon.
-
-From a source checkout, the equivalent command is `cargo run --release`. Cargo requires `--` only
-when forwarding CLI arguments, for example `cargo run --release -- status`; the installed binary
-uses the normal `net-pan status` form.
-
-Choose an initial Provider and destination:
-
-```bash
-cargo run --release -- \
-  --provider google \
-  --destination ~/Downloads
-```
-
-List the saved folder links and their count without opening the TUI or downloading anything:
-
-```bash
-cargo run --release -- --list
-```
-
-Use `--provider aliyun` to select Aliyun Drive for `--list` or as the initial TUI provider. When the
-flag is omitted, Google is preferred when ready; otherwise the first ready provider is used.
-The TUI still starts when no Provider is ready and opens `Settings` with `NeedsConfig`,
-`ConfigError`, or `ConnectionError` status. One failed Provider does not block another.
-
-Use `--overwrite` to replace completed destination files. Existing files are skipped by default.
-Use `--no-resume` to restart `.part` files instead of sending a Range request. Run
-`cargo run --release -- --help` for the complete command reference.
-
-## Optional Daemon
+## Daemon and CLI
 
 Start the long-lived runtime:
 
-```bash
+```sh
 net-pan daemon
 ```
 
-Query, pause, resume, or stop Jobs through the private local Unix socket:
+The TUI attaches to an available daemon; otherwise it uses an embedded runtime. Jobs owned by the
+daemon continue after the TUI exits.
 
-```bash
+Common script commands:
+
+```sh
 net-pan status
-net-pan pause 42
-net-pan resume 42
-net-pan cancel 42
-```
-
-Provider browsing and script submission use the same daemon-owned Provider instances as the TUI:
-
-```bash
 net-pan providers
-net-pan sources google --profile PROFILE_ID
-net-pan ls google SOURCE_ID FOLDER_OBJECT_ID --profile PROFILE_ID
-net-pan stat google SOURCE_ID OBJECT_ID --profile PROFILE_ID
-net-pan download google SOURCE_ID OBJECT_ID /absolute/local/destination \
-  --profile PROFILE_ID --workers 2
-net-pan job 42
+net-pan sources google --profile <PROFILE_ID>
+net-pan ls google <SOURCE_ID> <OBJECT_ID> --profile <PROFILE_ID>
+net-pan stat google <SOURCE_ID> <OBJECT_ID> --profile <PROFILE_ID>
+net-pan download google <SOURCE_ID> <OBJECT_ID> /absolute/destination \
+  --profile <PROFILE_ID> --workers 2
+net-pan job <JOB_ID>
 net-pan watch
+net-pan pause <JOB_ID>
+net-pan resume <JOB_ID>
+net-pan cancel <JOB_ID>
 ```
 
-These commands emit JSON (`watch` emits JSON Lines). Provider, Source, and object IDs are opaque;
-obtain them from the preceding command instead of parsing provider-specific URLs in scripts.
-
-The daemon owns the SQLite state, resumes interrupted Jobs when their Provider is available, and
-removes its `0600` socket on graceful shutdown. When the socket exists, the TUI validates the
-daemon, subscribes to complete Job snapshots, and submits downloads through IPC. Closing the TUI
-does not stop those Jobs. When no socket exists, the TUI uses an embedded foreground runtime. An
-existing but unusable socket is reported as an error instead of opening the same SQLite database
-from a second runtime.
-
-IPC protocol v5 carries provider-neutral Account catalog, Source, `RemoteRef`, masked settings, Job
-DTOs, and pause/resume controls.
-It persists idempotency mappings for `client_id + request_id` in the same transaction
-as the Job. A repeated matching request returns the original Job ID; reusing the key with different
-request JSON is rejected. Subscription startup always sends a complete snapshot, including after a
-daemon restart where the in-memory revision counter starts over. `net-pan submit <REQUEST.json>` is
-the low-level IPC/debug client and accepts an optional `--request-id`.
-
-The binary is only the CLI adapter for this path. `DaemonService` owns Provider instances, recovery,
-the download runtime, notification worker, and socket lifecycle. TUI and CLI use `DaemonPanClient`;
-without a socket the TUI swaps in `EmbeddedPanClient`. Both implement the same `PanClient`
-contract, and only the IPC module constructs versioned wire requests.
-
-An example user service is available at `contrib/net-pan.service`. Install the binary at
-`~/.local/bin/net-pan`, place the unit under `~/.config/systemd/user/`, then enable it with
-`systemctl --user enable --now net-pan.service`.
+Provider, source, and object IDs are opaque. Obtain them from preceding JSON responses rather than
+parsing provider-specific URLs. An example user service is available at `contrib/net-pan.service`.
 
 ## Notifications
 
-The daemon loads `~/.net-pan/notifiers.toml`. Restrict it to mode `0600`:
+The daemon reads `~/.net-pan/notifiers.toml` and supports DingTalk and Feishu webhook notifiers.
+Terminal job events are persisted in a SQLite outbox before delivery, retried with bounded backoff,
+and delivered idempotently. Restrict this file to mode `0600`.
 
-```toml
-[notifiers.dingtalk]
-enabled = true
-webhook = "https://oapi.dingtalk.com/robot/send?access_token=REDACTED"
-secret = "SEC_REDACTED"
+## Local Data
 
-[notifiers.feishu]
-enabled = false
-webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/REDACTED"
-secret = "REDACTED"
-```
-
-Job completion, partial failure, and fatal failure are inserted into the SQLite outbox in the same
-transaction as the terminal Job state. The daemon honors `Retry-After`, retries transient failures
-with bounded exponential backoff, and moves permanent or exhausted failures to DeadLetter. Webhook
-URLs, secrets, signatures, and signed download URLs are not written to Job history or logs.
-
-## Browser Keys
-
-### Global Navigation
-
-| Key | Action |
-|---|---|
-| `[` / `]` | Switch Provider Type while restoring its last active Account |
-| `Left` / `Right` | Move between Navigation and the current page |
-| `Up` / `Down`, then `Enter` | Select and open a Navigation route |
-| `Tab` / `Shift-Tab` | Switch subpanes only on pages that contain multiple panes |
-| `l` | Open Runtime Logs from any main page |
-| `g` | Open the separate Global Settings layer |
-| `Backspace` | Return from Global Settings or the current breadcrumb level |
-| `p` | Open the current Account's Source selector from Files |
-| `q` / `Ctrl-C` | Open the shared exit confirmation |
-
-The left Navigation contains `Accounts`, `Files`, `Transfers`, `Logs`, and `Settings`. On Accounts,
-use `Up` / `Down` to select an Account, `Enter` to open `Accounts / <account>` in place, `Space` to
-activate it, and `a` to create one with a custom name. `Backspace` returns from Account
-details to the list. The Settings route always edits the current Provider Account. Inside the Source
-selector, use `Up` / `Down`, `Enter`, and `Esc`. Each Source restores its own directory stack,
-selected item, list offset, and last status/error. Switching does not replace the Provider instance
-held by an active download job.
-
-### `Sources` level
-
-| Key | Action |
-|---|---|
-| `Up` | Select the previous item |
-| `Down` | Select the next item |
-| `PageUp` / `PageDown` | Move by one page |
-| `Home` / `End` | Select the first or last item |
-| `Enter` | Open the selected saved link |
-| `d` | Download the highlighted source folder recursively |
-| `r` | Reload source metadata |
-
-### Real folder level
-
-| Key | Action |
-|---|---|
-| `Up` / `Down` | Move the selection |
-| `PageUp` / `PageDown`, `Home` / `End` | Move by a page or jump to an edge |
-| `Enter` / `Right` | Open the highlighted child folder; hidden for other item types |
-| `Backspace` | Return to the parent level |
-| `r` | Reload the current folder's direct children |
-| `d` | Download the highlighted folder or downloadable regular file |
-
-### Download Form
-
-| Key | Action |
-|---|---|
-| `Left` / `Right`, `-` / `+`, `1`-`5` | Adjust concurrent file workers |
-| `Enter` | Validate the global root and start the download |
-| `Esc` | Cancel the form |
-| `q` / `Ctrl-C` | Open the shared exit confirmation |
-
-The destination is the single global download root configured in the upper Settings panel. It must
-be an existing absolute directory and cannot be a symbolic link. The form shows it read-only and
-combines it with the complete path from the saved source root to the highlighted item. A selected
-folder is downloaded as a complete tree below that root. File workers default to `1` and are
-clamped to `1`-`5`.
-
-### Transfers
-
-Each row renders a width-aware combined progress value such as
-`[############--------] 60% 140.1MB/233.5MB`. Narrow layouts shorten the bar and hide the separate
-speed column before truncating the percentage or byte counts. Use `Space` to pause or resume the
-current Job and `x` to stop it. Pausing retains `.part` files and the original Job ID; stopping is a
-manual failure shown as `STOP` and written at `ERROR` level. The selected Transfer's complete path
-and error chain are shown in the Detail area instead of replacing its progress cell.
-The completion summary reports `All` as the sum of Downloaded, Skipped, and Failed. The final
-Runtime Log also aggregates skip reasons, so a Job skipped because every destination already exists
-is explained without inspecting thousands of individual rows.
-
-### Logs Tab
-
-| Key | Action |
-|---|---|
-| `Up` / `Down` | Scroll one log entry |
-| `PageUp` / `PageDown` | Scroll one page |
-| `Home` / `End` | Jump to the first or latest filtered entry |
-| `a` | Show all levels |
-| `i` | Show `INFO` entries |
-| `e` | Show `ERROR` entries |
-| `f` | Cycle target: All, Runtime, Provider, Source, Daemon, Settings, Download |
-| `Tab` / `Shift-Tab` | Switch between the log list and detail pane |
-
-Runtime Logs use one chronological session stream and one rotated file. Provider and Source events
-are entries in that global stream rather than separate files, so initialization, refresh, directory
-loads, daemon disconnects, settings rebuilds, and downloads can be correlated in order. Level and
-target filters are independent and only affect the TUI view, not what is persisted.
-
-## Download Behavior
-
-After confirmation, the application recursively scans a highlighted folder or directly builds a
-single-file plan for a highlighted regular file. It does not write files if plan creation fails.
-Downloads run sequentially with the default single worker. With more than one worker, files are
-consumed concurrently from one bounded internal queue.
-
-Google Docs, Sheets, Slides, and other Google-native files require an export format and are skipped
-in this version. Items whose owner disabled downloading are also skipped.
-
-When interrupted, a partially downloaded file remains as `<name>.part`. The next default run
-requests the remaining bytes and validates the returned `Content-Range`. A completed stream is
-size-checked when the provider reports a size, synchronized to storage, and renamed to the final
-path. If the final local file already exists, it is skipped without opening a Provider download
-stream unless `--overwrite` was explicitly enabled.
-
-## Local State And Logs
-
-Persistent runtime files share one `net-pan` state root:
+All runtime data is stored below `~/.net-pan`:
 
 ```text
-~/.net-pan/settings.toml
-~/.net-pan/providers/<provider>/<profile>/config.toml
-~/.net-pan/state/state.db
-~/.net-pan/state/state.db-wal
-~/.net-pan/state/state.db-shm
-~/.net-pan/state/client-id
-~/.net-pan/state/net-pan.sock
-~/.net-pan/logs/
+settings.toml
+providers/<provider>/<profile>/config.toml
+state/state.db
+state/net-pan.sock
+logs/YYYY-MM-DD/net-pan_HH-mm-ss_NNN.log
+notifiers.toml
 ```
 
-Directories are restricted to mode `0700`; configuration, credentials, tokens, the database,
-stable IPC client ID, socket, and log files use private permissions. Secrets are not stored in
-SQLite.
+Provider directories use mode `0700`; configuration, token, database, socket, and log files use
+private permissions. System `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are ignored.
+Configure the global or provider proxy in the TUI.
 
-Each process writes immediately flushed, Loguru-style lines under:
+## Build
 
-```text
-~/.net-pan/logs/YYYY-MM-DD/net-pan_HH-mm-ss_000.log
+```sh
+git clone https://github.com/rainysteven1/net-pan.git
+cd net-pan
+cargo build --release
+./target/release/net-pan
 ```
 
-Files rotate at 10 MiB by incrementing the final number. The stream includes runtime startup,
-Provider/Source initialization and refresh, directory loads, daemon disconnects, settings saves and
-rebuilds, plus download events. Normal lifecycle events use `INFO`; failed operations use `ERROR`.
+Run project checks with:
 
-## Global Settings
-
-Press `g` from any non-editing context to open the separate Global Settings layer. The editable
-table contains only `Download path` and `Proxy URL`; connection mode, proxy precedence, and
-environment policy are shown separately as read-only information. Use `Up` / `Down` to select a
-field, `Enter` to start editing, and `Ctrl-S` to save. The download path must be an
-existing absolute real directory; relative, missing, regular-file, and symbolic-link paths are
-rejected. Saving it changes the root used by every subsequent Job. Enter an absolute HTTP or HTTPS
-proxy URL, or clear it for a direct connection; changing the proxy reconnects Providers. `Esc`
-stops editing, and `Backspace` returns from the layer when no field is being edited.
-An active Job keeps the destination captured when it was submitted; changing the global root does
-not move open files or `.part` data. The save Toast states this explicitly.
-Successful saves keep the Settings page open, leave editing mode, and show a centered confirmation
-Toast for two seconds. Validation and write failures keep the field in editing mode.
-
-The setting is stored with restricted permissions in `~/.net-pan/settings.toml`:
-
-```toml
-[download]
-destination = "/home/user/Downloads"
-
-[network]
-proxy = "http://127.0.0.1:7890"
+```sh
+./scripts/check.sh --full
 ```
 
-OAuth and provider API/download clients use this setting. The application explicitly ignores
-`HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`; when `proxy` is absent or blank, requests connect
-directly.
+Release and packaging details are documented in [docs/releasing.md](docs/releasing.md).
 
-The Settings navigation route displays fields supplied by the current
-`ProviderFactory::settings_schema()`. Use `Up` / `Down` to choose a field, `Enter` to start editing,
-`Ctrl-S` to save and rebuild, and `Space` to toggle booleans. Secret values are always masked; leaving an existing secret blank
-keeps it unchanged. Saving rebuilds only that Provider. If reconnect fails, the previous instance
-and edited input remain available. Editable Provider fields and read-only Action/derived fields are
-rendered in separate `EDITABLE SETTINGS` and `READ ONLY` sections; selection never enters read-only
-rows. Provider saves use the same centered two-second Toast behavior.
+## License
 
-## Known Limits
-
-- Aliyun behavior is covered by a controllable mock server; real-account browse/download/resume acceptance remains required.
-- Google service-account listing, small-file download, and `.part` Range resume were rerun successfully.
-- Google Installed App OAuth is implemented and mock-tested; real first-login acceptance requires a Desktop OAuth client JSON.
-- Native Aliyun first login, notifier Settings UI, and full daemon/PTY acceptance remain Phase 21-26 work.
-
-## Development Checks
-
-```bash
-just check --ci
-```
-
-Without `just`:
-
-```bash
-./scripts/check.sh --ci
-```
-
-Useful engineering commands:
-
-```bash
-just fmt
-just privacy
-just build
-just package
-just changelog
-just release-check 0.1.0
-```
-
-`release-check` never commits, tags, pushes, or publishes. Tag-driven GitHub Actions build Linux
-x86_64 and macOS x86_64/arm64 archives, attach SHA-256 checksums, and publish the checksum-verifying
-installer. See [docs/releasing.md](docs/releasing.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Repository files are checked for credentials, personal home paths, private infrastructure, and
-consumer email addresses. The release gate also checks Git author/committer email domains. Runtime
-configuration under `~/.net-pan` is excluded from packages and must never be committed.
-
-The architecture and gated implementation record are maintained in [DESIGN.md](DESIGN.md) and
-[TODO.md](TODO.md). Those two planning documents are intentionally written in Chinese.
-
-The TUI shell and interaction hierarchy adapt MIT-licensed layout patterns from
-[`cc-switch-cli`](https://github.com/saladday/cc-switch-cli). See
-[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) for attribution and license terms.
-
-The check scripts, packaging layout, checksum installer, and tag-driven release structure were
-inspired by [`box-link`](https://github.com/SZ-surveying/box-link), then adapted for a provider-based
-Linux/macOS downloader with stricter privacy and release-permission boundaries.
+Licensed under MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

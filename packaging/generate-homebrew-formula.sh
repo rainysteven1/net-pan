@@ -102,7 +102,7 @@ class NetPan < Formula
 
   def install
     bin.install "net-pan"
-    prefix.install "README.md", "LICENSE", "THIRD_PARTY_NOTICES"
+    prefix.install "README.md", "README_zh.md", "LICENSE", "THIRD_PARTY_NOTICES"
   end
 
   test do
