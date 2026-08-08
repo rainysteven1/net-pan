@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, digest::KeyInit};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -546,11 +546,13 @@ impl Notifier for WebhookNotifier {
 }
 
 fn dingtalk_signature(timestamp: i64, secret: &str) -> NotifierResult<String> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| NotifierError {
-        kind: NotifierErrorKind::Config,
-        message: "invalid DingTalk signing secret".to_owned(),
-        retryable: false,
-        retry_after: None,
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| {
+        NotifierError {
+            kind: NotifierErrorKind::Config,
+            message: "invalid DingTalk signing secret".to_owned(),
+            retryable: false,
+            retry_after: None,
+        }
     })?;
     mac.update(format!("{timestamp}\n{secret}").as_bytes());
     Ok(STANDARD.encode(mac.finalize().into_bytes()))
@@ -559,11 +561,13 @@ fn dingtalk_signature(timestamp: i64, secret: &str) -> NotifierResult<String> {
 fn feishu_signature(timestamp: i64, secret: &str) -> NotifierResult<String> {
     let signing_key = format!("{timestamp}\n{secret}");
     let mut mac =
-        Hmac::<Sha256>::new_from_slice(signing_key.as_bytes()).map_err(|_| NotifierError {
-            kind: NotifierErrorKind::Config,
-            message: "invalid Feishu signing secret".to_owned(),
-            retryable: false,
-            retry_after: None,
+        <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key.as_bytes()).map_err(|_| {
+            NotifierError {
+                kind: NotifierErrorKind::Config,
+                message: "invalid Feishu signing secret".to_owned(),
+                retryable: false,
+                retry_after: None,
+            }
         })?;
     mac.update(&[]);
     Ok(STANDARD.encode(mac.finalize().into_bytes()))
