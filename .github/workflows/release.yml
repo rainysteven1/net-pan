@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -83,7 +83,7 @@ jobs:
             platform: macos-aarch64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -119,7 +119,7 @@ jobs:
             "dist/net-pan-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}.tar.gz"
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: net-pan-${{ matrix.platform }}
           path: dist/net-pan-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}.tar.gz
@@ -134,13 +134,13 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: net-pan-*
           path: release-assets
@@ -176,7 +176,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: net-pan ${{ needs.validate.outputs.tag }}
           body: ${{ steps.git-cliff.outputs.content }}
