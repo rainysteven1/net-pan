@@ -16,22 +16,22 @@ anyhow = "1.0.104"
 async-recursion = "1.1.1"
 async-trait = "0.1.91"
 bytes = "1.11.1"
-base64 = "0.22.1"
+base64 = "0.23.1"
 chrono = "0.4.42"
 clap = { version = "4.6.5", features = ["derive"] }
 futures-util = "0.3.33"
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 httpdate = "1.0.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query", "stream", "form"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
-toml = "0.9.8"
+toml = "1.1.6"
 url = "2.5.8"
 
 [dev-dependencies]
